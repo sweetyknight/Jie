@@ -1,0 +1,9 @@
+/target
+.claude/settings.local.json
+/dist
+
+# OS metadata
+.DS_Store
+._*
+Thumbs.db
+Desktop.ini
