@@ -121,7 +121,7 @@ pub fn show() {
 
 thread_local! { static CAPTURING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 
-fn show_frame(mon: Monitor, frame: Bitmap, t0: Instant) {
+pub(crate) fn show_frame(mon: Monitor, frame: Bitmap, t0: Instant) {
     let windows = plat::window_rects(&mon);
     let t1 = t0.elapsed();
     let Some(dim) = frame.dimmed() else { return };
@@ -657,7 +657,7 @@ impl Overlay {
         Win::later(move || if ocr { card::ocr(img, anchor, mon) } else { card::translate(img, anchor, mon) });
     }
 
-    /// Esc、右键：有选区先清选区（标注一起清掉），没有就退出
+    /// 右键：有选区先清选区（标注一起清掉），没有就退出
     fn cancel(&mut self, w: Win) {
         if self.v.sel.is_none() {
             return w.close();
@@ -713,7 +713,7 @@ impl Handler for Overlay {
                 }
                 match key {
                     _ if used => {}
-                    Key::Esc => self.cancel(w),
+                    Key::Esc => w.close(),
                     Key::Enter => self.copy(w),
                     Key::Char(b'C') if mods.cmd => self.copy(w),
                     Key::Char(b'S') if mods.cmd && self.v.sel.is_some() => self.save(w),

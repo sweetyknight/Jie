@@ -142,10 +142,51 @@ fn start() {
         assert!(Win::all(Kind::Settings).is_empty(), "OK must apply settings and close");
         settings::load();
         assert_eq!(settings::sel_color(), 0xE0389A, "OK must persist the selected color");
+        check_overlay_escape();
         check_pin();
         check_clipboard();
         check_save_dialog(0);
     });
+}
+
+fn check_overlay_escape() {
+    let mon = plat::monitor_at(Point::default());
+    let app = NSApplication::sharedApplication(MainThreadMarker::new().unwrap());
+    for phase in ["selected", "dragging", "hover"] {
+        let frame = plat::Bitmap::new(mon.rect.right - mon.rect.left, mon.rect.bottom - mon.rect.top).unwrap();
+        Canvas::new(&frame, frame.full(), false).clear(ui::rgb(0xF0F0F0));
+        overlay::show_frame(mon, frame, std::time::Instant::now());
+        let w = Win::all(Kind::Overlay)[0];
+        let native = app.windows().iter().find(|n| n.isVisible() && n.title().to_string() == "Jie 截图").unwrap();
+        let view = native.contentView().unwrap();
+        if phase != "hover" {
+            for (typ, x, y) in [
+                (NSEventType::LeftMouseDown, 50.0, 50.0),
+                (NSEventType::LeftMouseDragged, 300.0, 200.0),
+                (NSEventType::LeftMouseUp, 300.0, 200.0),
+            ] {
+                if phase == "dragging" && typ == NSEventType::LeftMouseUp {
+                    break;
+                }
+                let event = NSEvent::mouseEventWithType_location_modifierFlags_timestamp_windowNumber_context_eventNumber_clickCount_pressure(
+                    typ, view.convertPoint_toView(NSPoint::new(x, y), None), NSEventModifierFlags::empty(),
+                    0.0, native.windowNumber(), None, 0, 1, 1.0,
+                ).unwrap();
+                match typ {
+                    NSEventType::LeftMouseDown => view.mouseDown(&event),
+                    NSEventType::LeftMouseDragged => view.mouseDragged(&event),
+                    _ => view.mouseUp(&event),
+                }
+            }
+        }
+        let event = NSEvent::keyEventWithType_location_modifierFlags_timestamp_windowNumber_context_characters_charactersIgnoringModifiers_isARepeat_keyCode(
+            NSEventType::KeyDown, NSPoint::default(), NSEventModifierFlags::empty(),
+            0.0, native.windowNumber(), None, &NSString::from_str("\u{1b}"), &NSString::from_str("\u{1b}"), false, 0x35,
+        ).unwrap();
+        app.sendEvent(&event);
+        assert!(!Win::all(Kind::Overlay).contains(&w), "one Esc must close the screenshot while {phase}");
+    }
+    eprintln!("overlay Esc passed: selected region, active drag and no selection");
 }
 
 fn check_pin() {
