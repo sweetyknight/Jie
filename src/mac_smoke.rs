@@ -1,11 +1,15 @@
 //! Runs AppKit integration checks on the OS main thread; no screen permission or saved settings changes.
 #![allow(dead_code, unused_imports)]
 #[cfg(target_os = "macos")]
+mod anim;
+#[cfg(target_os = "macos")]
 mod annotate;
 #[cfg(target_os = "macos")]
 mod app;
 #[cfg(target_os = "macos")]
 mod card;
+#[cfg(target_os = "macos")]
+mod hotkeys;
 #[cfg(target_os = "macos")]
 mod image_io;
 #[cfg(target_os = "macos")]
@@ -28,11 +32,17 @@ mod plat {
     }
 }
 #[cfg(target_os = "macos")]
+mod record;
+#[cfg(target_os = "macos")]
 mod settings;
 #[cfg(target_os = "macos")]
 mod settings_ui;
 #[cfg(target_os = "macos")]
+mod snap;
+#[cfg(target_os = "macos")]
 mod toast;
+#[cfg(target_os = "macos")]
+mod toolbar;
 #[cfg(target_os = "macos")]
 mod translate;
 #[cfg(target_os = "macos")]

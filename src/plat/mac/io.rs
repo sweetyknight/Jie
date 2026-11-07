@@ -1,8 +1,8 @@
 use super::{Bitmap, Win};
-use crate::plat::Image;
+use crate::plat::{Image, SaveAs};
 use objc2::{AnyThread, class, msg_send, rc::Retained, runtime::AnyObject};
 use objc2_app_kit::{NSBitmapImageFileType, NSBitmapImageRep, NSOpenPanel, NSPasteboard, NSPasteboardTypePNG, NSPasteboardTypeTIFF, NSSavePanel};
-use objc2_foundation::{NSArray, NSData, NSDictionary, NSNumber, NSString, NSURL};
+use objc2_foundation::{NSArray, NSData, NSDictionary, NSNumber, NSString, NSURL, ns_string};
 use std::path::PathBuf;
 
 fn encode_type(img: &Image, typ: NSBitmapImageFileType) -> Result<Vec<u8>, String> {
@@ -39,6 +39,24 @@ pub fn copy_image(img: &Image) -> Result<(), String> {
     Ok(())
 }
 
+/// 复制文件：剪贴板里放文件 URL（访达、聊天软件粘贴的是这个文件）；GIF 另放一份原始数据，认图片的程序直接贴动图
+pub fn copy_file(path: &std::path::Path) -> Result<(), String> {
+    let url = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
+    let pb = NSPasteboard::generalPasteboard();
+    pb.clearContents();
+    let s = url.absoluteString().ok_or("文件路径不对")?;
+    let ok = pb.setString_forType(&s, unsafe { objc2_app_kit::NSPasteboardTypeFileURL });
+    if !ok {
+        return Err("写入剪贴板失败".into());
+    }
+    if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("gif"))
+        && let Ok(bytes) = std::fs::read(path)
+    {
+        let _ = pb.setData_forType(Some(&NSData::with_bytes(&bytes)), ns_string!("com.compuserve.gif"));
+    }
+    Ok(())
+}
+
 pub fn copy_text(text: &str) -> Result<(), String> {
     let pb = NSPasteboard::generalPasteboard();
     pb.clearContents();
@@ -60,14 +78,14 @@ pub fn scale_down(src: &Bitmap, w: i32, h: i32) -> Option<Bitmap> {
     Some(b)
 }
 
-pub fn ask_save_path(owner: Win, dir: &str, name: &str, jpeg: bool) -> Option<PathBuf> {
+pub fn ask_save_path(owner: Win, dir: &str, name: &str, kind: SaveAs) -> Option<PathBuf> {
     let panel = NSSavePanel::savePanel(objc2::MainThreadMarker::new()?);
     let d = NSURL::fileURLWithPath(&NSString::from_str(dir));
     panel.setDirectoryURL(Some(&d));
-    panel.setNameFieldStringValue(&NSString::from_str(&format!("{}.{}", name, if jpeg { "jpg" } else { "png" })));
+    panel.setNameFieldStringValue(&NSString::from_str(&format!("{}.{}", name, kind.ext())));
     panel.setCanCreateDirectories(true);
     panel.setAllowsOtherFileTypes(false);
-    let typ: Retained<AnyObject> = unsafe { msg_send![class!(UTType), typeWithFilenameExtension:&*NSString::from_str(if jpeg {"jpg"} else {"png"})] };
+    let typ: Retained<AnyObject> = unsafe { msg_send![class!(UTType), typeWithFilenameExtension:&*NSString::from_str(kind.ext())] };
     let types = NSArray::from_slice(&[&*typ]);
     unsafe {
         let _: () = msg_send![&*panel,setAllowedContentTypes:&*types];

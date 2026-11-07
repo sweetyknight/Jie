@@ -7,8 +7,8 @@ use objc2::{AnyThread, MainThreadMarker};
 use objc2_app_kit::{NSEvent, NSScreen};
 use objc2_core_foundation::{CFArray, CFDictionary, CFNumber, CGPoint, CGRect, CGSize};
 use objc2_core_graphics::{
-    CGContext, CGImage, CGRectMakeWithDictionaryRepresentation, CGWindowListCopyWindowInfo, CGWindowListOption, kCGColorSpaceSRGB, kCGWindowBounds,
-    kCGWindowLayer,
+    CGContext, CGImage, CGRectMakeWithDictionaryRepresentation, CGWindowListCopyWindowInfo, CGWindowListOption, kCGColorSpaceSRGB, kCGWindowAlpha,
+    kCGWindowBounds, kCGWindowLayer,
 };
 use objc2_foundation::{NSArray, NSError, NSNumber, ns_string};
 use objc2_screen_capture_kit::{SCContentFilter, SCScreenshotManager, SCShareableContent, SCStreamConfiguration};
@@ -83,6 +83,13 @@ fn info_at(p: Point) -> Option<ScreenInfo> {
 }
 pub(crate) fn cocoa_frame(r: Rect) -> CGRect {
     info_at(Point { x: (r.left + r.right) / 2, y: (r.top + r.bottom) / 2 }).map(|s| s.cocoa(r)).unwrap_or_default()
+}
+/// 区域所在的显示器编号，和区域在这块显示器上的位置（点，左上角为原点；SCStream 的 sourceRect 用）
+pub(crate) fn display_rect(r: Rect) -> Option<(u32, CGRect)> {
+    let s = info_at(Point { x: (r.left + r.right) / 2, y: (r.top + r.bottom) / 2 })?;
+    let k = s.scale;
+    let origin = CGPoint::new((r.left - s.rect.left) as f64 / k, (r.top - s.rect.top) as f64 / k);
+    Some((s.id, CGRect::new(origin, CGSize::new((r.right - r.left) as f64 / k, (r.bottom - r.top) as f64 / k))))
 }
 pub(crate) fn cocoa_point(p: Point) -> CGPoint {
     info_at(p).map(|s| s.cocoa(Rect { left: p.x, top: p.y, right: p.x, bottom: p.y }).origin).unwrap_or_default()
@@ -225,6 +232,11 @@ pub fn window_rects(mon: &Monitor) -> Vec<Rect> {
         let dict = unsafe { &*(ptr as *const CFDictionary) };
         let layer = unsafe { dict.value(kCGWindowLayer as *const _ as *const c_void) };
         if layer.is_null() || unsafe { (&*(layer as *const CFNumber)).as_i32() } != Some(0) {
+            continue;
+        }
+        // 全透明的窗口看不见，却会挡住下面真正的窗口
+        let alpha = unsafe { dict.value(kCGWindowAlpha as *const _ as *const c_void) };
+        if !alpha.is_null() && unsafe { (&*(alpha as *const CFNumber)).as_f64() }.is_some_and(|a| a <= 0.0) {
             continue;
         }
         let bounds = unsafe { dict.value(kCGWindowBounds as *const _ as *const c_void) };

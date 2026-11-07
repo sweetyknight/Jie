@@ -7,11 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 
-// 快捷键的修饰键位，就是 Windows RegisterHotKey 的 MOD_*；mac 把 MOD_WIN 当 ⌘。两个平台读同一份配置
-pub const MOD_ALT: u32 = 1;
-pub const MOD_CONTROL: u32 = 2;
-pub const MOD_SHIFT: u32 = 4;
-pub const MOD_WIN: u32 = 8;
+pub use crate::plat::{MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_WIN};
 
 /// 全局快捷键：修饰键（MOD_*）和 Windows 的虚拟键码
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -23,12 +19,7 @@ pub struct Hotkey {
 impl Hotkey {
     /// 「Alt + Shift + A」这样的名字（顺序同 Windows：Ctrl、Alt、Shift）；`sep` 是连接符
     pub fn name(self, sep: &str) -> String {
-        let names: &[(u32,&str)] = if cfg!(target_os="macos") {
-            &[(MOD_CONTROL,"⌃"),(MOD_ALT,"⌥"),(MOD_SHIFT,"⇧"),(MOD_WIN,"⌘")]
-        } else { &[(MOD_CONTROL,"Ctrl"),(MOD_ALT,"Alt"),(MOD_SHIFT,"Shift")] };
-        let mut v: Vec<String> = names.iter().filter(|(m,_)| self.mods & m != 0).map(|(_,n)|n.to_string()).collect();
-        v.push(plat::key_name(self.vk));
-        v.join(if cfg!(target_os="macos") {""} else {sep})
+        plat::hotkey_name(self.mods, self.vk, sep)
     }
 
     /// 至少带 Ctrl 或 Alt，否则会抢掉普通按键
@@ -50,6 +41,12 @@ pub enum Format {
 #[serde(default)]
 pub struct Settings {
     pub hotkey: Hotkey,
+    /// 录屏快捷键：打开录屏选区，录制中再按一次停止；不能和截图快捷键相同
+    pub record_hotkey: Hotkey,
+    /// 录屏帧率，FPS_CHOICES 里的一个
+    pub record_fps: u32,
+    /// 录好的动图钉在屏幕上时外面画一圈选区颜色的框（和屏幕内容一样时看得清范围）
+    pub gif_frame: bool,
     /// 选区颜色 0xRRGGBB
     pub sel_color: u32,
     /// 保存对话框的起始文件夹；空表示系统的「图片」文件夹
@@ -64,11 +61,16 @@ pub struct Settings {
 }
 
 pub const DEFAULT_COLOR: u32 = 0x9C44EC;
+/// 设置里能选的录屏帧率
+pub const FPS_CHOICES: [u32; 4] = [10, 15, 20, 30];
 
 impl Default for Settings {
     fn default() -> Self {
         Settings {
             hotkey: Hotkey { mods: MOD_ALT | MOD_SHIFT, vk: 'A' as u32 },
+            record_hotkey: Hotkey { mods: MOD_ALT | MOD_SHIFT, vk: 'S' as u32 },
+            record_fps: 15,
+            gif_frame: true,
             sel_color: DEFAULT_COLOR,
             save_dir: String::new(),
             save_format: Format::Png,
@@ -84,8 +86,15 @@ impl Default for Settings {
 impl Settings {
     /// 手改出来的非法值换回默认值
     fn sanitized(mut self) -> Self {
+        let d = Settings::default();
         if !self.hotkey.valid() {
-            self.hotkey = Settings::default().hotkey;
+            self.hotkey = d.hotkey;
+        }
+        if !self.record_hotkey.valid() || self.record_hotkey == self.hotkey {
+            self.record_hotkey = if d.record_hotkey == self.hotkey { d.hotkey } else { d.record_hotkey };
+        }
+        if !FPS_CHOICES.contains(&self.record_fps) {
+            self.record_fps = d.record_fps;
         }
         self.sel_color &= 0xFF_FFFF;
         self
@@ -210,11 +219,21 @@ mod tests {
     fn partial_and_invalid_values() {
         let p = dir("partial").join("settings.json");
         // 缺的字段用默认值，不认识的字段（包括 4.8 删掉的 ocr_lang、ocr_llm）忽略，不合规的快捷键换回默认
-        std::fs::write(&p, r#"{"sel_color": 15022139, "model": "m", "extra": 1, "ocr_lang": "zh-Hans-CN", "ocr_llm": false, "hotkey": {"mods": 4, "vk": 65}}"#).unwrap();
+        std::fs::write(&p, r#"{"sel_color": 15022139, "model": "m", "extra": 1, "ocr_lang": "zh-Hans-CN", "ocr_llm": false, "hotkey": {"mods": 4, "vk": 65}, "record_fps": 7}"#).unwrap();
         let s = read(&p);
-        assert_eq!((s.sel_color, s.model.as_str()), (0xE5383B, "m"));
+        assert_eq!((s.sel_color, s.model.as_str(), s.record_fps), (0xE5383B, "m", 15));
         assert!(s.hotkey == Settings::default().hotkey);
         assert!(s.save_format == Format::Png && s.target == Lang::Zh);
+    }
+
+    /// 录屏快捷键和截图快捷键撞了：换回录屏的默认值；截图快捷键正好是录屏的默认值时，录屏用截图的默认值
+    #[test]
+    fn record_hotkey_never_equals_capture() {
+        let d = Settings::default();
+        let same = Settings { record_hotkey: d.hotkey, ..d.clone() }.sanitized();
+        assert!(same.record_hotkey == d.record_hotkey);
+        let swapped = Settings { hotkey: d.record_hotkey, record_hotkey: d.record_hotkey, ..d.clone() }.sanitized();
+        assert!(swapped.hotkey == d.record_hotkey && swapped.record_hotkey == d.hotkey);
     }
 
     #[test]
@@ -232,6 +251,7 @@ mod tests {
     #[cfg(windows)]
     fn hotkey_names() {
         assert_eq!(Settings::default().hotkey.name(" + "), "Alt + Shift + A");
+        assert_eq!(Settings::default().record_hotkey.name("+"), "Alt+Shift+S");
         assert_eq!(Hotkey { mods: MOD_CONTROL | MOD_SHIFT, vk: 'A' as u32 }.name("+"), "Ctrl+Shift+A");
         assert_eq!(Hotkey { mods: MOD_ALT, vk: 0x71 }.name("+"), "Alt+F2");
         assert_eq!(Hotkey { mods: MOD_CONTROL | MOD_ALT, vk: '1' as u32 }.name("+"), "Ctrl+Alt+1");

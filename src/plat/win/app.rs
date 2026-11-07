@@ -27,8 +27,8 @@ static APP: OnceLock<App> = OnceLock::new();
 /// Explorer 重启后会广播这条消息，收到就重新添加托盘图标
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 static MAIN_WINDOW: AtomicIsize = AtomicIsize::new(0);
-/// 全局快捷键现在是否注册成功
-static HOTKEY_OK: AtomicBool = AtomicBool::new(false);
+/// 各个全局快捷键（按编号 1–4）现在是否注册成功
+static HOTKEY_OK: [AtomicBool; 4] = [const { AtomicBool::new(false) }; 4];
 /// 托盘图标加上了没有（以低完整性运行时 Explorer 不让加，这时 Jie 看不见也点不着）
 static TRAY_OK: AtomicBool = AtomicBool::new(false);
 /// 点了正显示的通知要做的事
@@ -127,19 +127,21 @@ pub(crate) fn app_icon(cx: i32) -> HICON {
     }
 }
 
-/// 换全局快捷键（先注销旧的）；`mods` 是 MOD_ALT 这类位，`vk` 是虚拟键码。返回是否注册成功
-pub fn set_hotkey(mods: u32, vk: u32) -> bool {
+/// 换编号 `id`（1–4）的全局快捷键（先注销旧的）；`mods` 是 MOD_ALT 这类位，`vk` 是虚拟键码。返回是否注册成功。
+/// 按下时调 `App::hotkey(id)`
+pub fn set_hotkey(id: usize, mods: u32, vk: u32) -> bool {
+    let Some(slot) = HOTKEY_OK.get(id.wrapping_sub(1)) else { return false };
     let hwnd = main_window();
     unsafe {
-        let _ = UnregisterHotKey(Some(hwnd), 1);
-        let ok = RegisterHotKey(Some(hwnd), 1, HOT_KEY_MODIFIERS(mods) | MOD_NOREPEAT, vk).is_ok();
-        HOTKEY_OK.store(ok, Ordering::Relaxed);
+        let _ = UnregisterHotKey(Some(hwnd), id as i32);
+        let ok = RegisterHotKey(Some(hwnd), id as i32, HOT_KEY_MODIFIERS(mods) | MOD_NOREPEAT, vk).is_ok();
+        slot.store(ok, Ordering::Relaxed);
         ok
     }
 }
 
-pub fn hotkey_ok() -> bool {
-    HOTKEY_OK.load(Ordering::Relaxed)
+pub fn hotkey_ok(id: usize) -> bool {
+    HOTKEY_OK.get(id.wrapping_sub(1)).is_some_and(|s| s.load(Ordering::Relaxed))
 }
 
 fn tray_data(hwnd: HWND) -> NOTIFYICONDATAW {
@@ -205,7 +207,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             WM_DRAWITEM if super::menu_draw(lp) => return LRESULT(1),
             // NOTIFYICON_VERSION_4：lParam 低位是事件，wParam 是弹菜单的锚点坐标
             WM_TRAY => match lp.0 as u32 & 0xFFFF {
-                NIN_SELECT | NIN_KEYSELECT => (app().capture)(),
+                NIN_SELECT | NIN_KEYSELECT => (app().tray_click)(),
                 WM_CONTEXTMENU => (app().tray_menu)(POINT { x: wp.0 as i16 as i32, y: (wp.0 >> 16) as i16 as i32 }),
                 NIN_BALLOONUSERCLICK => {
                     // 先取出来再调，f 里可能又弹通知
@@ -216,7 +218,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 }
                 _ => {}
             },
-            WM_HOTKEY => (app().capture)(),
+            WM_HOTKEY => (app().hotkey)(wp.0),
             WM_RUN => (Box::from_raw(lp.0 as *mut Job))(),
             // 又启动了一个 Jie：托盘正常就提示、回 1，新的那个退出；托盘没加上就关掉自己、回 0，让新的接替
             WM_AGAIN => {

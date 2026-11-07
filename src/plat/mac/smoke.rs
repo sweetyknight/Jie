@@ -155,7 +155,7 @@ fn check_overlay_escape() {
     for phase in ["selected", "dragging", "hover"] {
         let frame = plat::Bitmap::new(mon.rect.right - mon.rect.left, mon.rect.bottom - mon.rect.top).unwrap();
         Canvas::new(&frame, frame.full(), false).clear(ui::rgb(0xF0F0F0));
-        overlay::show_frame(mon, frame, std::time::Instant::now());
+        overlay::show_frame(overlay::Mode::Shot, mon, frame, std::time::Instant::now());
         let w = Win::all(Kind::Overlay)[0];
         let native = app.windows().iter().find(|n| n.isVisible() && n.title().to_string() == "Jie 截图").unwrap();
         let view = native.contentView().unwrap();
@@ -368,7 +368,8 @@ fn check_save_dialog(step: usize) {
             app.stopModalWithCode(objc2_app_kit::NSModalResponseOK);
         }
     });
-    owner.ask_save(dir.to_string_lossy().into_owned(), "saved".into(), jpeg, move |p| {
+    let kind = if jpeg { plat::SaveAs::Jpeg } else { plat::SaveAs::Png };
+    owner.ask_save(dir.to_string_lossy().into_owned(), "saved".into(), kind, move |p| {
         assert!(owner.enabled());
         let app = NSApplication::sharedApplication(MainThreadMarker::new().unwrap());
         let overlay = app.windows().iter().find(|w| w.isVisible() && w.title().to_string() == "save smoke").unwrap();

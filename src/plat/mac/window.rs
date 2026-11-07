@@ -535,7 +535,7 @@ impl Win {
             n.set(v.wrapping_add(1).max(1));
             v
         });
-        let base = JieWindow::alloc(mtm).set_ivars(WindowIvars { id, focusable: !matches!(spec.kind, Kind::Toast | Kind::PinBar) });
+        let base = JieWindow::alloc(mtm).set_ivars(WindowIvars { id, focusable: !matches!(spec.kind, Kind::Toast | Kind::PinBar | Kind::RecFrame | Kind::RecBar) });
         let custom: Retained<JieWindow> =
             unsafe { msg_send![super(base), initWithContentRect: frame_for(spec.rect), styleMask: style, backing: NSBackingStoreType::Buffered, defer: false] };
         custom.setDelegate(Some(ProtocolObject::from_ref(&*custom)));
@@ -565,6 +565,8 @@ impl Win {
         w.setLevel(match spec.kind {
             Kind::Overlay => objc2_app_kit::NSScreenSaverWindowLevel,
             Kind::Settings => objc2_app_kit::NSNormalWindowLevel,
+            // 录屏的边框、倒计时、控制条会压在 Dock、菜单栏那条上（全屏录制时控制条放在 Dock 上）：浮动层在 Dock 下面会被挡住
+            Kind::RecFrame | Kind::RecBar => objc2_app_kit::NSStatusWindowLevel,
             _ => objc2_app_kit::NSFloatingWindowLevel,
         });
         w.setAnimationBehavior(NSWindowAnimationBehavior::None);
@@ -573,11 +575,11 @@ impl Win {
             w.setCollectionBehavior(NSWindowCollectionBehavior::CanJoinAllSpaces | NSWindowCollectionBehavior::FullScreenAuxiliary);
         }
         // AppKit rounds frames to whole points; odd-sized Retina pins leave spare backing pixels.
-        w.setOpaque(!matches!(spec.kind, Kind::Pin | Kind::PinBar | Kind::Toast));
-        if matches!(spec.kind, Kind::Pin | Kind::PinBar | Kind::Toast) {
+        w.setOpaque(!matches!(spec.kind, Kind::Pin | Kind::PinBar | Kind::Toast | Kind::RecFrame | Kind::RecBar));
+        if matches!(spec.kind, Kind::Pin | Kind::PinBar | Kind::Toast | Kind::RecFrame | Kind::RecBar) {
             w.setBackgroundColor(Some(&NSColor::clearColor()));
         }
-        if spec.kind == Kind::Toast {
+        if matches!(spec.kind, Kind::Toast | Kind::RecFrame) {
             w.setIgnoresMouseEvents(true);
         }
         if let Some(owner) = spec.owner {
@@ -593,7 +595,7 @@ impl Win {
     }
     pub fn show(self) {
         if let Some(w) = WINDOWS.with(|v| v.borrow().iter().find(|e| e.id == self.0).map(|e| e.win.clone())) {
-            if state_for(self).is_some_and(|s| matches!(s.kind, Kind::PinBar | Kind::Toast)) {
+            if state_for(self).is_some_and(|s| matches!(s.kind, Kind::PinBar | Kind::Toast | Kind::RecFrame | Kind::RecBar)) {
                 w.orderFrontRegardless();
             } else {
                 w.makeKeyAndOrderFront(None);
@@ -605,6 +607,10 @@ impl Win {
         if let Some(w) = WINDOWS.with(|v| v.borrow().iter().find(|e| e.id == self.0).map(|e| e.win.clone())) {
             w.orderOut(None);
         }
+    }
+    /// 不录进录屏：录屏开始时按窗口编号把录屏边框和控制条从这一路截屏里排除（见 record.rs），这里不用做什么；别人截屏、共享照样看得到
+    pub fn hide_from_capture(self) -> bool {
+        true
     }
     pub fn close(self) {
         Self::later(move || {
@@ -637,7 +643,7 @@ impl Win {
     }
     pub fn invalidate(self, r: Rect) {
         if let Some(v) = view_for(self) {
-            if state_for(self).is_some_and(|s| matches!(s.kind, Kind::Toast | Kind::PinBar)) {
+            if state_for(self).is_some_and(|s| matches!(s.kind, Kind::Toast | Kind::PinBar | Kind::RecFrame | Kind::RecBar)) {
                 v.setNeedsDisplay(true);
             } else {
                 let k = self.scale() as f64;
@@ -764,8 +770,14 @@ impl Win {
         }
         result
     }
-    pub fn ask_save(self, dir: String, name: String, jpeg: bool, then: impl FnOnce(Option<PathBuf>) + 'static) {
-        Self::later(move || then(super::ask_save_path(self, &dir, &name, jpeg)));
+    /// 系统保存对话框：文件类型 `kind`，从 `dir` 开始、默认文件名 `name`（不带扩展名）；取消时交给 `then` 的是 None
+    pub fn ask_save(self, dir: String, name: String, kind: crate::plat::SaveAs, then: impl FnOnce(Option<PathBuf>) + 'static) {
+        Self::later(move || then(super::ask_save_path(self, &dir, &name, kind)));
+    }
+
+    /// 系统给这个窗口的编号（CGWindowID），录屏排除自己的窗口用
+    pub(crate) fn window_number(self) -> Option<u32> {
+        native(self).map(|w| w.windowNumber() as u32)
     }
     pub fn ask_folder(self, start: String, then: impl FnOnce(Option<String>) + 'static) {
         Self::later(move || then(super::ask_folder(self, &start)));
@@ -854,7 +866,7 @@ impl Win {
         if let Some(s) = state_for(self) {
             if let Some(v) = s.fields.borrow_mut().get_mut(&id) {
                 v.hotkey = (m, vk);
-                v.control.setStringValue(&NSString::from_str(&crate::settings::Hotkey { mods: m, vk }.name("")));
+                v.control.setStringValue(&NSString::from_str(&crate::plat::hotkey_name(m, vk, "")));
             }
         }
     }

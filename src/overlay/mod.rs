@@ -1,26 +1,35 @@
-//! 截图遮罩：冻结画面、框选、窗口吸附、操作栏、标注。
+//! 截图遮罩：冻结画面、框选、吸附（页面里的边界、窗口、整块屏幕）、操作栏、标注。
+//! 录屏也从这里框选：录屏快捷键打开只能框选的遮罩，框好后交给 record。
 //!
 //! 坐标都是窗口内容区的物理像素，也就是截图里的像素。每次重画按要重画的那块现合成：
 //! 暗图打底、亮区贴原图、画边框，选区里叠标注，再叠手柄、读数、操作栏这些装饰。
-
-pub(crate) mod bar;
-pub(crate) mod opts;
 
 use crate::annotate::{self, Doc, Editor, Pt, Tool};
 use crate::card;
 use crate::image_io;
 use crate::pin;
 use crate::plat::{self, Bitmap, Button, Canvas, Cursor, Event, Face, Handler, Key, Kind as WinKind, Monitor, Point, Rect, Spec, Stroke, Text, Win};
+use crate::record;
+use crate::snap;
 use crate::toast::{self, Kind};
+use crate::toolbar::opts::{self, Item, Opts};
+use crate::toolbar::{self, Act, Bar, act_of, tool_of};
 use crate::ui::{self, Hud, rectf, rgb};
-use bar::{Act, Bar};
-use opts::{Item, Opts};
 use std::time::Instant;
 
 /// 8 个手柄，按 左上、上、右上、右、右下、下、左下、左；0/1/2 = 左（上）边、中间、右（下）边
 const HANDLES: [(u8, u8); 8] = [(0, 0), (1, 0), (2, 0), (2, 1), (2, 2), (1, 2), (0, 2), (0, 1)];
 /// 工具提示：悬停 400ms 后出现
 const TIP_TIMER: usize = 1;
+
+/// 遮罩用来做什么
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Mode {
+    /// 截图：框选、标注、复制保存钉图取字翻译，也能转去录屏
+    Shot,
+    /// 录屏：只框选，主按钮是开始录制
+    Record,
+}
 
 /// 操作栏和工具选项条上的按钮
 #[derive(Clone, Copy, PartialEq)]
@@ -90,6 +99,7 @@ enum Deco {
 }
 
 struct Overlay {
+    mode: Mode,
     mon: Monitor,
     frame: Bitmap,
     dim: Bitmap,
@@ -100,6 +110,12 @@ struct Overlay {
     sel: u32,
     /// 吸附用的窗口，从上到下
     windows: Vec<Rect>,
+    /// 鼠标下一层层的边界（从小到大，最后是窗口、整块屏幕），现在高亮第几层；滚轮换层，攒够 120 才走一格
+    snaps: Vec<Rect>,
+    level: usize,
+    wheel_acc: i32,
+    /// 层是滚轮换过的：鼠标挪动后新的一组里还有这个框，就留着它
+    picked: bool,
     /// 标注；坐标就是截图的像素
     ed: Editor,
     v: View,
@@ -107,7 +123,7 @@ struct Overlay {
 }
 
 /// 快捷键、托盘入口：冻结鼠标所在的显示器并打开遮罩；已经开着就不再开
-pub fn show() {
+pub fn show(mode: Mode) {
     if CAPTURING.with(|p| p.get()) || !Win::all(WinKind::Overlay).is_empty() {
         return;
     }
@@ -115,27 +131,38 @@ pub fn show() {
     CAPTURING.with(|p| p.set(true));
     plat::request_capture(move |result| {
         CAPTURING.with(|p| p.set(false));
-        if let Some((mon, frame)) = result { show_frame(mon, frame, t0); }
+        if let Some((mon, frame)) = result {
+            show_frame(mode, mon, frame, t0);
+        }
     });
 }
 
-thread_local! { static CAPTURING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+thread_local! {
+    static CAPTURING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// 录屏延时开始几秒（0 是点了就录）；本次运行内记住，每次启动从不延时开始
+    static DELAY: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
 
-pub(crate) fn show_frame(mon: Monitor, frame: Bitmap, t0: Instant) {
+/// 「延时开始」按钮依次换的几档（秒）
+const DELAYS: [u64; 4] = [0, 3, 5, 10];
+
+pub(crate) fn show_frame(mode: Mode, mon: Monitor, frame: Bitmap, t0: Instant) {
     let windows = plat::window_rects(&mon);
     let t1 = t0.elapsed();
     let Some(dim) = frame.dimmed() else { return };
     let t2 = t0.elapsed();
     let s = mon.scale();
-    let Some(label) = Text::new(Face::Ui, 13.0 * s, true, "复制") else { return };
+    let Some(label) = Text::new(Face::Ui, 13.0 * s, true, if mode == Mode::Record { "开始录制" } else { "复制" }) else { return };
     let (w, h) = (frame.w, frame.h);
+    // 录屏选区和截图一样用设置里的选区颜色，录制中的边框也是它
     let sel = crate::settings::sel_color();
     let label_w = label.width();
     let ed = Editor::new(Doc::default(), s);
-    let mut state = Overlay { mon, frame, dim, label, label_w, sel, windows, ed, v: View::default(), drag: Drag::None };
+    let mut state = Overlay { mode, mon, frame, dim, label, label_w, sel, windows, snaps: Vec::new(), level: 0, wheel_acc: 0, picked: false, ed, v: View::default(), drag: Drag::None };
     let c = plat::cursor_pos();
-    state.v.hover = Some(state.snap_at(Point { x: c.x - mon.rect.left, y: c.y - mon.rect.top }));
-    let Some(win) = Win::open(Spec { kind: WinKind::Overlay, rect: mon.rect, title: "Jie 截图", owner: None }, state) else { return };
+    state.hover_at(Point { x: c.x - mon.rect.left, y: c.y - mon.rect.top });
+    let title = if mode == Mode::Record { "Jie 录屏" } else { "Jie 截图" };
+    let Some(win) = Win::open(Spec { kind: WinKind::Overlay, rect: mon.rect, title, owner: None }, state) else { return };
     // 显示时当场画完第一帧
     win.show();
     let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
@@ -175,25 +202,6 @@ fn minus(a: Rect, b: Rect) -> Vec<Rect> {
 
 fn dist(a: Point, b: Point) -> f32 {
     ((a.x - b.x) as f32).hypot((a.y - b.y) as f32)
-}
-
-/// 操作栏上的标注工具按钮
-const TOOL_ACTS: [(Act, Tool); 7] = [
-    (Act::Rect, Tool::Rect),
-    (Act::Ellipse, Tool::Ellipse),
-    (Act::Arrow, Tool::Arrow),
-    (Act::Pen, Tool::Pen),
-    (Act::Text, Tool::Text),
-    (Act::Num, Tool::Num),
-    (Act::Mosaic, Tool::Mosaic),
-];
-
-pub(crate) fn tool_of(a: Act) -> Option<Tool> {
-    TOOL_ACTS.iter().find(|(x, _)| *x == a).map(|(_, t)| *t)
-}
-
-pub(crate) fn act_of(t: Tool) -> Act {
-    TOOL_ACTS.iter().find(|(_, x)| *x == t).map_or(Act::Rect, |(a, _)| *a)
 }
 
 /// 四条边整理成正向矩形，夹在 w × h 里；没有面积时为 None
@@ -273,10 +281,53 @@ impl Overlay {
         dip * self.mon.scale()
     }
 
-    /// 点下面最上层的窗口；哪个窗口都不在就是整块屏幕
-    fn snap_at(&self, p: Point) -> Rect {
+    /// 点下面一层层的边界：窗口里认出来的面板、卡片这些（从小到大），然后是最上层的窗口，最外面是整块屏幕；
+    /// 录屏时窗口和整块屏幕之间还有「屏幕去掉任务栏」（录它时控制条放在任务栏上，见 record.rs）。
+    /// 和默认高亮的那层（主要的面板，没有就是窗口）
+    fn snaps_at(&self, p: Point) -> (Vec<Rect>, usize) {
         let full = Rect { left: 0, top: 0, right: self.frame.w, bottom: self.frame.h };
-        self.windows.iter().find(|r| contains(r, p)).copied().unwrap_or(full)
+        let win = self.windows.iter().find(|r| contains(r, p)).copied().unwrap_or(full);
+        let mut v = snap::boxes(self.frame.pixels(), self.frame.w, self.frame.h, p, win, self.mon.scale());
+        let def = snap::default_level(&v, &win, self.mon.scale());
+        let (m, wk) = (self.mon.rect, self.mon.work);
+        let work = Rect { left: wk.left - m.left, top: wk.top - m.top, right: wk.right - m.left, bottom: wk.bottom - m.top };
+        // 盖住任务栏的窗口（全屏应用）外面不套工作区，免得一层比一层小
+        let around = |o: &Rect, i: &Rect| o.left <= i.left && o.top <= i.top && o.right >= i.right && o.bottom >= i.bottom;
+        let work = (self.mode == Mode::Record && around(&work, &win)).then_some(work);
+        for r in [Some(win), work, Some(full)].into_iter().flatten() {
+            if v.last().is_none_or(|l| !snap::same(l, &r)) {
+                v.push(r);
+            }
+        }
+        // 认出来的最外层可能已经和窗口差不多大，窗口那层就是它
+        let def = def.unwrap_or_else(|| v.iter().position(|r| snap::same(r, &win)).unwrap_or(v.len() - 1));
+        (v, def)
+    }
+
+    /// 没有选区时鼠标挪到 p：换了一组边界就高亮默认那层，滚轮换过的那个框新的一组里也有就留着；还是那组就不动
+    fn hover_at(&mut self, p: Point) {
+        let (v, def) = self.snaps_at(p);
+        if v != self.snaps {
+            let kept = self.v.hover.filter(|_| self.picked).and_then(|h| v.iter().position(|r| snap::same(r, &h)));
+            self.picked = kept.is_some();
+            (self.snaps, self.level) = (v, kept.unwrap_or(def));
+        }
+        self.v.hover = self.snaps.get(self.level).copied();
+    }
+
+    /// 滚轮：往上（离开用户）换外面一层，往下换里面一层
+    fn wheel(&mut self, w: Win, delta: i32) {
+        self.wheel_acc += delta;
+        let n = self.wheel_acc / 120;
+        if n == 0 || self.snaps.is_empty() {
+            return;
+        }
+        self.wheel_acc %= 120;
+        let level = (self.level as i32 + n).clamp(0, self.snaps.len() as i32 - 1) as usize;
+        self.update(w, |s| {
+            (s.level, s.picked) = (level, true);
+            s.v.hover = s.snaps.get(level).copied();
+        });
     }
 
     /// 有选区、没在拖时才有操作栏；有工具选项条时给它留出位置
@@ -287,7 +338,13 @@ impl Overlay {
         }
         let s = self.mon.scale();
         let opt_h = self.ed.opts().map_or(0, |(k, t)| Opts::size(k, t, s).1 + self.px(4.0).round() as i32);
-        Some(Bar::layout(sel, self.frame.w, self.frame.h, s, self.label_w, opt_h, false))
+        let items: &'static toolbar::Items = if self.mode == Mode::Record { &toolbar::RECORD } else { &toolbar::SHOT };
+        let mut bar = Bar::layout(sel, self.frame.w, self.frame.h, s, self.label_w, opt_h, items);
+        let d = DELAY.get();
+        if self.mode == Mode::Record && d > 0 {
+            bar.badge = Some((Act::Delay, d.to_string()));
+        }
+        Some(bar)
     }
 
     /// 工具选项条：和操作栏左对齐，在操作栏远离选区的那一侧（操作栏在选区里面时放它上方），间距 4
@@ -341,11 +398,19 @@ impl Overlay {
         if contains(&r, p) { Hit::Inside } else { Hit::Outside }
     }
 
-    /// 尺寸读数：选区左上角上方 6 处；顶上放不下就放进选区左上角里面
+    /// 尺寸读数：选区左上角上方 6 处；顶上放不下就放进选区左上角里面。
+    /// 录屏选区前面标「录屏」；还没选、鼠标下有好几层时后面提示滚轮能换
     fn readout(&self) -> Option<Deco> {
         let r = self.v.lit()?;
         let text = format!("{} × {}", r.right - r.left, r.bottom - r.top);
-        let hud = Hud::new(&[(&text, 0xFFFFFF)], self.mon.scale())?;
+        let mut parts = vec![(text.as_str(), 0xFFFFFF)];
+        if self.mode == Mode::Record {
+            parts.insert(0, ("录屏", self.sel));
+        }
+        if self.v.sel.is_none() && self.snaps.len() > 1 {
+            parts.push(("滚轮调整范围", ui::HUD_TEXT2));
+        }
+        let hud = Hud::new(&parts, self.mon.scale())?;
         let (m, g) = (self.px(4.0) as i32, self.px(6.0) as i32);
         let (mut x, mut y) = (r.left, r.top - g - hud.h);
         if y < m {
@@ -361,6 +426,12 @@ impl Overlay {
             Btn::Bar(a) => (bar.button(a), bar.tip(a)),
             Btn::Opt(i) => (opts?.button(i), opts::tip(self.ed.opts()?.0, i)),
         };
+        // 延时按钮的提示写出现在是哪一档
+        let delay = match DELAY.get() {
+            0 => "延时开始：关（点一下换 3、5、10 秒）".to_string(),
+            d => format!("延时开始：{d} 秒"),
+        };
+        let name = if self.v.tip == Some(Btn::Bar(Act::Delay)) { delay.as_str() } else { name };
         let parts: &[(&str, u32)] = if key.is_empty() { &[(name, 0xFFFFFF)] } else { &[(name, 0xFFFFFF), (key, ui::HUD_TEXT2)] };
         let hud = Hud::new(parts, self.mon.scale())?;
         let (m, g) = (self.px(4.0) as i32, self.px(6.0) as i32);
@@ -372,8 +443,19 @@ impl Overlay {
         Some(Deco::Hud(hud, x, y))
     }
 
+    /// 录屏选区还没框时，屏幕顶上居中一行说明
+    fn banner(&self) -> Option<Deco> {
+        if self.mode != Mode::Record || self.v.sel.is_some() {
+            return None;
+        }
+        let parts = [("● 录屏", self.sel), ("拖动框选要录的区域，或单击选中高亮的那块", 0xFFFFFF), ("Esc 退出", ui::HUD_TEXT2)];
+        let hud = Hud::new(&parts, self.mon.scale())?;
+        let x = (self.frame.w - hud.w) / 2;
+        Some(Deco::Hud(hud, x, self.px(16.0) as i32))
+    }
+
     fn decos(&self) -> Vec<Deco> {
-        let mut v = Vec::new();
+        let mut v: Vec<Deco> = self.banner().into_iter().collect();
         if let Some(r) = self.v.sel
             && !self.v.framing
             && self.ed.tool.is_none()
@@ -418,8 +500,14 @@ impl Overlay {
 
     /// 改状态都走这里：前后对比，只把变了的地方标成要重画
     fn update(&mut self, w: Win, f: impl FnOnce(&mut Self)) {
-        let (v0, d0, l0) = (self.v, self.deco_rects(), self.ed.looks());
+        let before = (self.v, self.deco_rects(), self.ed.looks());
         f(self);
+        self.updated(w, before);
+    }
+
+    /// `update` 改完以后：和改之前比，标重画。不跟着闭包泛型（十几个调用点各复制一份会多出好几 KB）
+    #[inline(never)]
+    fn updated(&mut self, w: Win, (v0, d0, l0): (View, Vec<Rect>, Vec<(Rect, usize, usize)>)) {
         self.sync();
         w.ime(self.ed.caret(|p| p));
         // 标注：变了的那几个，新旧范围都重画
@@ -535,7 +623,7 @@ impl Overlay {
                     _ => None,
                 };
                 if s.v.sel.is_none() {
-                    s.v.hover = Some(s.snap_at(p));
+                    s.hover_at(p);
                 }
             }
         });
@@ -563,7 +651,7 @@ impl Overlay {
                 _ => {}
             }
             if s.v.sel.is_none() {
-                s.v.hover = Some(s.snap_at(cur));
+                s.hover_at(cur);
             }
         });
         // 拖完松手时鼠标可能正停在刚出现的操作栏上
@@ -595,6 +683,15 @@ impl Overlay {
             Act::Cancel => w.close(),
             Act::Save => self.save(w),
             Act::Pin => self.pin(w),
+            Act::Record => self.record(w),
+            Act::Delay => {
+                let i = DELAYS.iter().position(|d| *d == DELAY.get()).unwrap_or(0);
+                self.update(w, |_| DELAY.set(DELAYS[(i + 1) % DELAYS.len()]));
+                // 角标画在操作栏里面，操作栏的范围没变，自己标重画
+                if let Some(b) = self.bar() {
+                    w.invalidate(b.button(Act::Delay));
+                }
+            }
             Act::Ocr => self.recognize(w, true),
             Act::Translate => self.recognize(w, false),
             _ => {}
@@ -647,6 +744,16 @@ impl Overlay {
         Win::later(move || pin::create(img, at, Editor::new(Doc::with(anns), scale)));
     }
 
+    /// 录屏：遮罩关掉（释放截图帧）以后，在选区这块活的屏幕上开始录（按「延时开始」选的先倒数）
+    fn record(&mut self, w: Win) {
+        let Some(r) = self.v.sel else { return };
+        let (dx, dy, mon) = (self.mon.rect.left, self.mon.rect.top, self.mon);
+        let region = Rect { left: r.left + dx, top: r.top + dy, right: r.right + dx, bottom: r.bottom + dy };
+        w.close();
+        let delay = std::time::Duration::from_secs(DELAY.get());
+        Win::later(move || record::start(mon, region, delay));
+    }
+
     /// 取字、翻译：遮罩立刻关闭、释放截图帧，卡片单独留在屏幕上；按原图识别，不带标注
     fn recognize(&mut self, w: Win, ocr: bool) {
         let Some(r) = self.v.sel else { return };
@@ -666,7 +773,8 @@ impl Overlay {
         let cur = w.cursor_pos();
         self.update(w, |s| {
             s.ed = Editor::new(Doc::default(), s.mon.scale());
-            s.v = View { hover: Some(s.snap_at(cur)), ..View::default() };
+            s.v = View::default();
+            s.hover_at(cur);
         });
     }
 }
@@ -683,8 +791,10 @@ impl Handler for Overlay {
             }
         }
         match e {
-            // 双击选区复制只在没选工具、没点在标注上时生效；其余当成又一次按下（连续放序号）
-            Event::Down { p, button: Button::Left, double: true, .. } if self.hit_at(p) == Hit::Inside && self.ed.tool.is_none() && self.ed.hit(pt(p)).is_none() => self.copy(w),
+            // 双击选区复制（录屏选区里是开始录制）只在没选工具、没点在标注上时生效；其余当成又一次按下（连续放序号）
+            Event::Down { p, button: Button::Left, double: true, .. } if self.hit_at(p) == Hit::Inside && self.ed.tool.is_none() && self.ed.hit(pt(p)).is_none() => {
+                if self.mode == Mode::Record { self.record(w) } else { self.copy(w) }
+            }
             Event::Down { p, button: Button::Left, .. } => self.mouse_down(w, p),
             Event::Move { p, mods } => self.mouse_move(w, p, mods.shift),
             Event::Up { button: Button::Left, .. } => self.mouse_up(w),
@@ -705,6 +815,13 @@ impl Handler for Overlay {
             }
             // 在抬起时处理：按下就关的话，抬起会落到下面的窗口上，弹出它的右键菜单
             Event::Up { button: Button::Right, .. } => self.cancel(w),
+            Event::Wheel { delta, .. } if self.v.sel.is_none() => self.wheel(w, delta),
+            // 录屏选区没有标注：Esc 退出，Enter 开始录
+            Event::Key { key, .. } if self.mode == Mode::Record => match key {
+                Key::Esc => w.close(),
+                Key::Enter => self.record(w),
+                _ => {}
+            },
             Event::Key { key, mods } => {
                 // 标注快捷键：工具、撤销重做、删除
                 let mut used = false;
@@ -780,7 +897,7 @@ mod tests {
     use crate::plat::Mods;
 
     fn open() -> Win {
-        show();
+        show(Mode::Shot);
         *Win::all(WinKind::Overlay).last().expect("遮罩没出来")
     }
 
@@ -842,6 +959,43 @@ mod tests {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join("test-tmp").join("overlay");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join(name), plat::encode(img, false).unwrap()).unwrap();
+    }
+
+    /// 录屏选区：鼠标停在屏幕中间（默认那层、往外滚一格），再框一块。画面存成 target/test-tmp/overlay/record-*.png。
+    /// 会截屏、盖住屏幕一会儿，平时不跑：cargo test record_mode_overlay -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn record_mode_overlay() {
+        show(Mode::Record);
+        let w = *Win::all(WinKind::Overlay).last().expect("遮罩没出来");
+        let s = w.peek::<Overlay>();
+        let (cx, cy) = (s.frame.w / 2, s.frame.h / 2);
+        mv(w, cx, cy);
+        println!("默认第 {} 层：{:?}", s.level, s.snaps);
+        png(&screen(w).crop(&Rect { left: 0, top: 0, right: s.frame.w, bottom: s.frame.h }), "record-hover.png");
+        let before = s.v.hover;
+        w.send(Event::Wheel { delta: 120, p: Point { x: cx, y: cy }, mods: Mods::default() });
+        assert!(s.picked && (s.level + 1 == s.snaps.len() || s.v.hover != before));
+        // 挪一点，滚过的那层还在
+        let kept = s.v.hover;
+        mv(w, cx + 3, cy + 3);
+        assert_eq!(s.v.hover, kept);
+        drag(w, (cx - 300, cy - 200), (cx + 300, cy + 200));
+        let sel = s.v.sel.expect("没框上");
+        png(&screen(w).crop(&Rect { left: sel.left - 60, top: sel.top - 80, right: sel.right + 60, bottom: sel.bottom + 120 }), "record-selected.png");
+        // 默认不延时；点「延时开始」换成 3 秒，按钮上出角标；再点三下绕回不延时
+        assert_eq!(DELAY.get(), 0);
+        let delay = s.bar().unwrap().button(Act::Delay);
+        click(w, delay);
+        assert!(DELAY.get() == 3 && s.bar().unwrap().badge.is_some());
+        let b = s.bar().unwrap().rect;
+        png(&screen(w).crop(&Rect { left: b.left - 10, top: b.top - 10, right: b.right + 10, bottom: b.bottom + 50 }), "record-delay.png");
+        for _ in 0..3 {
+            click(w, delay);
+        }
+        assert!(DELAY.get() == 0 && s.bar().unwrap().badge.is_none());
+        key(w, Key::Esc);
+        assert!(!w.alive());
     }
 
     #[test]

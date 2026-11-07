@@ -6,7 +6,7 @@
 
 use super::field::{self, Fields, WM_FIELDKEY};
 use super::{Bitmap, Canvas, menu_draw, menu_measure, popup_menu};
-use crate::plat::{Button, Cursor, Edge, Event, FieldKind, Handler, Hit, Key, Kind, MenuItem, Monitor, Mods, Point, Rect, Spec, ring_pixels};
+use crate::plat::{Button, Cursor, Edge, Event, FieldKind, Handler, Hit, Key, Kind, MenuItem, Monitor, Mods, Point, Rect, SaveAs, Spec, ring_pixels};
 use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
@@ -72,12 +72,14 @@ fn class(kind: Kind) -> PCWSTR {
         Kind::Card => w!("Jie.Card"),
         Kind::Toast => w!("Jie.Toast"),
         Kind::Settings => w!("Jie.Settings"),
+        Kind::RecFrame => w!("Jie.RecFrame"),
+        Kind::RecBar => w!("Jie.RecBar"),
     }
 }
 
 /// 透明窗口：整张画好用 UpdateLayeredWindow 贴，没有 WM_PAINT
 fn layered(kind: Kind) -> bool {
-    matches!(kind, Kind::PinBar | Kind::Toast)
+    matches!(kind, Kind::PinBar | Kind::Toast | Kind::RecFrame | Kind::RecBar)
 }
 
 fn styles(kind: Kind) -> (WINDOW_EX_STYLE, WINDOW_STYLE) {
@@ -85,8 +87,8 @@ fn styles(kind: Kind) -> (WINDOW_EX_STYLE, WINDOW_STYLE) {
     match kind {
         Kind::Overlay | Kind::Card => (pop, WS_POPUP),
         Kind::Pin => (pop | WS_EX_LAYERED, WS_POPUP),
-        Kind::PinBar => (pop | WS_EX_LAYERED | WS_EX_NOACTIVATE, WS_POPUP),
-        Kind::Toast => (pop | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE, WS_POPUP),
+        Kind::PinBar | Kind::RecBar => (pop | WS_EX_LAYERED | WS_EX_NOACTIVATE, WS_POPUP),
+        Kind::Toast | Kind::RecFrame => (pop | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE, WS_POPUP),
         // 设计稿的标题栏只有关闭按钮
         Kind::Settings => (WINDOW_EX_STYLE::default(), WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN),
     }
@@ -201,7 +203,7 @@ impl Win {
         let h = self.hwnd();
         unsafe {
             match st.kind {
-                Kind::PinBar | Kind::Toast => {
+                Kind::PinBar | Kind::Toast | Kind::RecFrame | Kind::RecBar => {
                     render(h);
                     let _ = ShowWindow(h, SW_SHOWNOACTIVATE);
                 }
@@ -220,6 +222,13 @@ impl Win {
 
     pub fn hide(self) {
         let _ = unsafe { ShowWindow(self.hwnd(), SW_HIDE) };
+    }
+
+    /// 不录进录屏，别人截屏、远程桌面照样看得到：显示前记下它底下的画面，录屏时每帧盖回去（见 record.rs）。
+    /// 要在 `show` 之前调，窗口之后别挪；截不下来时返回 false
+    pub fn hide_from_capture(self) -> bool {
+        let mut r = Rect::default();
+        unsafe { GetWindowRect(self.hwnd(), &mut r) }.is_ok() && super::record::cover(self.0, r)
     }
 
     /// 这个线程上开着的某种窗口
@@ -406,10 +415,10 @@ impl Win {
         });
     }
 
-    /// 系统保存对话框（等这次处理完；期间这个窗口照常显示、不能操作）：PNG 或 JPEG，从 `dir` 开始、
-    /// 默认文件名 `name`（不带扩展名）；取消时交给 `then` 的是 None
-    pub fn ask_save(self, dir: String, name: String, jpeg: bool, then: impl FnOnce(Option<PathBuf>) + 'static) {
-        Self::later(move || then(super::ask_save_path(self.hwnd(), &dir, &name, jpeg)));
+    /// 系统保存对话框（等这次处理完；期间这个窗口照常显示、不能操作）：文件类型 `kind`（PNG、JPEG 时两种都能选），
+    /// 从 `dir` 开始、默认文件名 `name`（不带扩展名）；取消时交给 `then` 的是 None
+    pub fn ask_save(self, dir: String, name: String, kind: SaveAs, then: impl FnOnce(Option<PathBuf>) + 'static) {
+        Self::later(move || then(super::ask_save_path(self.hwnd(), &dir, &name, kind)));
     }
 
     /// 系统选择文件夹对话框（等这次处理完），从 `start` 开始
@@ -807,7 +816,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             WM_NCHITTEST => {
                 return match kind {
                     // 胶囊：鼠标穿透
-                    Kind::Toast => LRESULT(HTTRANSPARENT as isize),
+                    Kind::Toast | Kind::RecFrame => LRESULT(HTTRANSPARENT as isize),
                     Kind::Card => {
                         let mut p = point(lp);
                         let _ = ScreenToClient(hwnd, &mut p);
@@ -822,7 +831,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 };
             }
             // 点操作栏不抢前台，钉图保持在前台、继续收键盘
-            WM_MOUSEACTIVATE if kind == Kind::PinBar => return LRESULT(MA_NOACTIVATE as isize),
+            WM_MOUSEACTIVATE if matches!(kind, Kind::PinBar | Kind::RecBar) => return LRESULT(MA_NOACTIVATE as isize),
             // 卡片的大小只由它自己定（见 State::size）
             WM_WINDOWPOSCHANGING if kind == Kind::Card => {
                 let p = &mut *(lp.0 as *mut WINDOWPOS);
@@ -940,6 +949,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             WM_NCDESTROY => {
                 SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+                super::record::uncover(hwnd.0 as isize);
                 WINDOWS.with_borrow_mut(|v| v.retain(|w| w.0 != hwnd.0 as isize));
                 let p = st as *const State as *mut State;
                 // 正在处理它自己的事时被关（不该发生）：宁可漏掉也不释放还在用的

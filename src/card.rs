@@ -379,6 +379,15 @@ impl Card {
     /// 按当前内容和缩放比例重新排版
     fn relayout(&mut self) {
         (self.blocks, self.content_h, self.row_y) = self.layout_body().unwrap_or_default();
+        // 拖高了、内容填不满：原文开关行（连同展开的原文）贴到最底下，空白留在译文下面
+        if self.user_h.is_some() && matches!(self.body, Body::Translate(_)) {
+            let extra = self.body_h() as f32 - self.content_h;
+            if extra > 0.0 {
+                self.row_y += extra;
+                self.blocks.iter_mut().filter(|b| b.part == Part::Orig).for_each(|b| b.y += extra);
+                self.content_h += extra;
+            }
+        }
         self.scroll = self.scroll.clamp(0.0, self.max_scroll());
     }
 
@@ -1053,6 +1062,61 @@ mod tests {
         assert_eq!(c.hit(w, Point { x: cw - 2, y: 100 }), Hit::Edge(Edge::Right));
         assert_eq!(c.hit(w, Point { x: 200, y: 20 }), Hit::Caption);
         w.close();
+    }
+
+    /// 拖高的翻译卡片：内容填不满时原文开关行贴在正文区最底下，展开的原文跟着它；内容放得满时还接在译文后面
+    #[test]
+    fn orig_row_sticks_to_bottom() {
+        let tr = |open: bool| Body::Translate(Tr { orig: "Hello world".into(), src: None, lines: 1, open, state: TrState::Done("你好世界".into()) });
+        let mut c = Card {
+            scale: 1.0,
+            work: Rect { left: 0, top: 0, right: 1920, bottom: 1080 },
+            title: "翻译",
+            translate: true,
+            pair: String::new(),
+            meta: String::new(),
+            body: tr(false),
+            blocks: Vec::new(),
+            content_h: 0.0,
+            row_y: 0.0,
+            copied: false,
+            scroll: 0.0,
+            sel_part: Part::Main,
+            anchor: 0,
+            caret: 0,
+            selecting: false,
+            hot: None,
+            down: None,
+            angle: 0.0,
+            user_w: None,
+            user_h: None,
+        };
+        c.relayout();
+        let natural = c.row_y;
+        // 没拖过高度：卡片跟着内容，开关行接在译文后面
+        assert_eq!(c.row_y + c.px(ORIG_ROW), c.content_h);
+        for open in [false, true] {
+            c.body = tr(open);
+            c.user_h = Some(600.0);
+            c.relayout();
+            let bottom = c.body_h() as f32;
+            assert!(c.row_y > natural && (c.content_h - bottom).abs() < 1.0, "开关行没贴底：{} / {bottom}", c.row_y);
+            assert_eq!(c.max_scroll(), 0.0);
+            if open {
+                let orig = c.blocks.iter().find(|b| b.part == Part::Orig).unwrap();
+                assert!(orig.y > c.row_y, "展开的原文该在开关行下面");
+            } else {
+                assert!((c.row_y + c.px(ORIG_ROW) - bottom).abs() < 1.0);
+            }
+        }
+        // 译文长、卡片矮：放不下就照常接在后面、滚动
+        c.body = Body::Translate(Tr { orig: "Hello".into(), src: None, lines: 1, open: false, state: TrState::Done("一段会自动折行的文字，".repeat(20)) });
+        c.user_h = None;
+        c.relayout();
+        let natural = c.row_y;
+        c.user_h = Some(HEAD + FOOT + 3.0 * LINE);
+        c.relayout();
+        assert!(c.row_y == natural && c.max_scroll() > 0.0);
     }
 
     /// 翻译卡片走一遍：没配置 → 识别 → 本地 mock 回 401 → 换服务地址点重试 → 成功（原文默认折叠）→ 展开原文；

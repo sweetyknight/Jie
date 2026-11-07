@@ -183,12 +183,12 @@ mod tests {
     #[test]
     #[ignore]
     fn bar_samples() {
-        use crate::overlay::bar::{Act, Bar};
+        use crate::toolbar::{Act, Bar, SHOT};
         use crate::plat::Bitmap;
         let s = 1.5;
         let bmp = Bitmap::new(1100, 330).unwrap();
         let label = Text::new(Face::Ui, 13.0 * s, true, "复制").unwrap();
-        let bar = Bar::layout(RECT { left: 0, top: 0, right: 1090, bottom: 0 }, 1100, 330, s, label.width(), 0, false);
+        let bar = Bar::layout(RECT { left: 0, top: 0, right: 1090, bottom: 0 }, 1100, 330, s, label.width(), 0, &SHOT);
         {
             let c = Canvas::new(&bmp, bmp.full(), false);
             c.clear(rgb(0x707070));

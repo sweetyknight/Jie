@@ -1,6 +1,6 @@
-//! 保存截图：对话框的起始位置和默认文件名，在工作线程里编码写文件，写完出胶囊。
+//! 保存截图和录屏动图：对话框的起始位置和默认文件名，在工作线程里编码（或拷贝）写文件，写完出胶囊。
 
-use crate::plat::{self, Image, Monitor, Win};
+use crate::plat::{self, Image, Monitor, SaveAs, Win};
 use crate::settings;
 use crate::toast::{self, Kind};
 use std::path::PathBuf;
@@ -9,10 +9,29 @@ use std::path::PathBuf;
 /// 选好了把路径交给 `then`，取消就什么都不做
 pub fn ask_save(w: Win, then: impl FnOnce(PathBuf) + 'static) {
     let s = settings::get();
-    w.ask_save(s.save_dir(), format!("Jie_{}", plat::now_stamp()), s.save_format == settings::Format::Jpeg, move |p| {
+    let kind = if s.save_format == settings::Format::Jpeg { SaveAs::Jpeg } else { SaveAs::Png };
+    w.ask_save(s.save_dir(), format!("Jie_{}", plat::now_stamp()), kind, move |p| {
         if let Some(p) = p {
             then(p);
         }
+    });
+}
+
+/// 保存动图的对话框：只能存 GIF，起始位置和默认文件名同截图
+pub fn ask_save_gif(w: Win, then: impl FnOnce(PathBuf) + 'static) {
+    w.ask_save(settings::get().save_dir(), format!("Jie_{}", plat::now_stamp()), SaveAs::Gif, move |p| {
+        if let Some(p) = p {
+            then(p);
+        }
+    });
+}
+
+/// 在工作线程里把文件 `src` 拷成 `dst`（录屏的动图已经写好在临时文件里），写完回到界面线程出胶囊
+pub fn copy_async(src: PathBuf, dst: PathBuf, mon: Monitor) {
+    std::thread::spawn(move || {
+        let result = if src == dst { Ok(0) } else { std::fs::copy(&src, &dst) };
+        let result = result.map(|_| dst).map_err(|e| e.to_string());
+        plat::post(move || saved(result, mon));
     });
 }
 

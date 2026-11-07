@@ -57,7 +57,13 @@ pub fn window_rects(mon: &Monitor) -> Vec<RECT> {
                 return TRUE;
             }
             // 鼠标穿透的多是全屏覆盖层（显卡、录屏软件的浮层），吸上去没意义
-            if GetWindowLongW(h, GWL_EXSTYLE) as u32 & WS_EX_TRANSPARENT.0 != 0 {
+            let ex = GetWindowLongW(h, GWL_EXSTYLE) as u32;
+            if ex & WS_EX_TRANSPARENT.0 != 0 {
+                return TRUE;
+            }
+            // 整体全透明的分层窗口看不见，却会挡住下面真正的窗口
+            let (mut alpha, mut flags) = (255u8, LAYERED_WINDOW_ATTRIBUTES_FLAGS(0));
+            if ex & WS_EX_LAYERED.0 != 0 && GetLayeredWindowAttributes(h, None, Some(&mut alpha), Some(&mut flags)).is_ok() && flags.contains(LWA_ALPHA) && alpha == 0 {
                 return TRUE;
             }
             // 被系统藏起来的：别的虚拟桌面上的、挂起的商店应用

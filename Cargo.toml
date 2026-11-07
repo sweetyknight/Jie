@@ -8,6 +8,9 @@ publish = false
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ureq = { version = "3", default-features = false, features = ["native-tls"] }
+# 录屏的 GIF 编解码（纯 Rust，MIT/Apache-2.0）；量化直接用 color_quant，gif 自带的量化不管透明色会不会和别的颜色撞格
+gif = { version = "0.14", default-features = false, features = ["std", "raii_no_panic"] }
+color_quant = "1.1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # 框架绑定一律关掉默认特性按需开：默认会把 AVFoundation 这些用不上的框架也链进来，启动就加载、白占内存
@@ -18,9 +21,16 @@ objc2-foundation = { version = "0.3", default-features = false, features = ["std
 objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFCGTypes", "CFNumber"] }
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "objc2-core-foundation", "objc2-core-graphics", "NSGraphics", "NSApplication", "NSResponder", "NSStatusBar", "NSStatusItem", "NSStatusBarButton", "NSButton", "NSControl", "NSCell", "NSView", "NSWindow", "NSPanel", "NSEvent", "NSGraphicsContext", "NSScreen", "NSRunningApplication", "NSAnimation", "NSColor", "NSFont", "NSBitmapImageRep", "NSImageRep", "NSImage", "NSMenu", "NSMenuItem", "NSPasteboard", "NSSavePanel", "NSOpenPanel", "NSAlert", "NSStringDrawing", "NSText", "NSTextField", "NSSecureTextField", "NSTextView", "NSTextInputClient", "NSTextInputContext", "NSTrackingArea", "NSCursor", "NSAppearance", "NSAttributedString"] }
 objc2-core-graphics = { version = "0.3", default-features = false, features = ["std", "objc2", "CGBitmapContext", "CGColorSpace", "CGContext", "CGImage", "CGDataProvider", "CGWindow", "CGDirectDisplay", "CGGeometry", "CGError", "CGEvent", "CGEventSource", "CGFont", "CGWindowLevel"] }
-objc2-screen-capture-kit = { version = "0.3", default-features = false, features = ["std", "block2", "objc2-core-graphics", "objc2-core-foundation", "SCScreenshotManager", "SCShareableContent", "SCStream"] }
+objc2-screen-capture-kit = { version = "0.3", default-features = false, features = ["std", "block2", "dispatch2", "objc2-core-graphics", "objc2-core-foundation", "objc2-core-media", "SCScreenshotManager", "SCShareableContent", "SCStream"] }
+# 录屏的帧：ScreenCaptureKit 本来就要加载这两个框架
+objc2-core-media = { version = "0.3", default-features = false, features = ["std", "objc2-core-video", "CMBase", "CMSampleBuffer", "CMTime"] }
+objc2-core-video = { version = "0.3", default-features = false, features = ["std", "CVBase", "CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVReturn"] }
 objc2-core-text = { version = "0.3", default-features = false, features = ["std", "CTFont", "CTFontTraits", "CTFontDescriptor", "CTLine", "CTTypesetter", "CTStringAttributes", "objc2-core-graphics"] }
 security-framework = { version = "3", default-features = false }
+
+# 只给测试用：9.6 实测读进程内存
+[target.'cfg(windows)'.dev-dependencies]
+windows = { version = "0.62", features = ["Win32_System_ProcessStatus"] }
 
 [target.'cfg(windows)'.dependencies]
 # windows 的一部分（Matrix3x2、Vector2），已经是它的依赖
@@ -52,6 +62,7 @@ features = [
     "Win32_UI_HiDpi",
     "Win32_UI_Input_Ime",
     "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Magnification",
     "Win32_UI_Shell",
     "Win32_UI_Shell_Common",
     "Win32_UI_WindowsAndMessaging",

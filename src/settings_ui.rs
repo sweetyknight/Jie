@@ -3,7 +3,8 @@
 //! 快捷键注册失败就恢复原键、停在窗口里提示。尺寸按设计稿（DIP）乘窗口所在显示器的缩放比例。
 
 use crate::plat::{self, Button, Canvas, Cursor, Event, Face, FieldKind, Handler, Key, MenuItem, Point, Rect, RectF, Spec, Stroke, Text, Win};
-use crate::settings::{self, Format, Hotkey, Settings};
+use crate::hotkeys;
+use crate::settings::{self, FPS_CHOICES, Format, Hotkey, Settings};
 use crate::toast::{self, Kind};
 use crate::translate::{self, Lang};
 use crate::ui::{self, rectf, rgb, rgba};
@@ -40,7 +41,12 @@ const OK: u32 = 0x107C10;
 /// 设置窗口的字一律 Segoe UI（不用界面字的 Variable 版），和系统输入框里的字一样
 const FONT: Face = Face::Segoe;
 
-const PAGES: [&str; 4] = ["截图", "保存", "文字识别", "翻译"];
+const PAGES: [&str; 5] = ["截图", "录屏", "保存", "文字识别", "翻译"];
+const SHOT_PAGE: usize = 0;
+const REC_PAGE: usize = 1;
+const SAVE_PAGE: usize = 2;
+const OCR_PAGE: usize = 3;
+const TR_PAGE: usize = 4;
 const PRESETS: [(&str, u32); 7] =
     [("紫", 0x9C44EC), ("品红", 0xE0389A), ("红", 0xE5383B), ("橙", 0xF27A1A), ("黄", 0xF5B700), ("绿", 0x23A55A), ("白", 0xFFFFFF)];
 const TARGETS: [(Lang, &str); 3] = [(Lang::Zh, "简体中文"), (Lang::En, "English"), (Lang::Ja, "日本語")];
@@ -56,6 +62,10 @@ enum Ctl {
     Hue,
     Browse,
     Format(usize),
+    /// 录屏帧率，FPS_CHOICES 里的第几个
+    Fps(usize),
+    /// 录屏页的「动图边框」开关
+    GifFrame,
     Target,
     /// 模型框右边的「选择…」（翻译页和文字识别页各一个，用的是当前页的框）
     Models,
@@ -68,6 +78,7 @@ enum Ctl {
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Child {
     Hotkey,
+    RecHotkey,
     SaveDir,
     Hex,
     Endpoint,
@@ -79,17 +90,27 @@ enum Child {
     OcrKey,
 }
 
-const CHILDREN: [Child; 9] =
-    [Child::Hotkey, Child::SaveDir, Child::Hex, Child::Endpoint, Child::Model, Child::Key, Child::OcrEndpoint, Child::OcrModel, Child::OcrKey];
-const OCR_PAGE: usize = 2;
+const CHILDREN: [Child; 10] = [
+    Child::Hotkey,
+    Child::RecHotkey,
+    Child::SaveDir,
+    Child::Hex,
+    Child::Endpoint,
+    Child::Model,
+    Child::Key,
+    Child::OcrEndpoint,
+    Child::OcrModel,
+    Child::OcrKey,
+];
 
 impl Child {
     fn page(self) -> usize {
         match self {
-            Child::Hotkey | Child::Hex => 0,
-            Child::SaveDir => 1,
+            Child::Hotkey | Child::Hex => SHOT_PAGE,
+            Child::RecHotkey => REC_PAGE,
+            Child::SaveDir => SAVE_PAGE,
             Child::OcrEndpoint | Child::OcrModel | Child::OcrKey => OCR_PAGE,
-            _ => 3,
+            _ => TR_PAGE,
         }
     }
 }
@@ -129,10 +150,13 @@ struct Ui {
     picker: bool,
     save_dir: String,
     format: Format,
+    fps: u32,
+    gif_frame: bool,
     target: Lang,
     key0: String,
     ocr_key0: String,
-    hk_bad: Option<String>,
+    /// 哪个快捷键框有问题、原因
+    hk_bad: Option<(Child, String)>,
     test: Test,
     test_id: u32,
     /// 「选择…」最近一次拉到的模型
@@ -147,7 +171,7 @@ pub fn show(hotkey: bool) {
     if let Some(&w) = Win::all(plat::Kind::Settings).first() {
         if hotkey {
             w.with(|ui: &mut Ui| {
-                ui.set_page(0);
+                ui.set_page(SHOT_PAGE);
                 w.focus_field(Some(Child::Hotkey as usize));
             });
         }
@@ -174,6 +198,8 @@ pub fn show(hotkey: bool) {
         picker: !PRESETS.iter().any(|p| p.1 == orig.sel_color),
         save_dir: orig.save_dir.clone(),
         format: orig.save_format,
+        fps: orig.record_fps,
+        gif_frame: orig.gif_frame,
         target: orig.target,
         key0: plat::api_key(settings::TRANSLATE_KEY),
         ocr_key0: plat::api_key(settings::OCR_KEY),
@@ -307,14 +333,19 @@ impl Ui {
         CX + self.drop_w(self.target_label()) + 8.0 + self.tw(self.target_hint(), 12.0, false) > RIGHT
     }
 
-    fn seg_w(&self, i: usize) -> f32 {
-        (self.tw(["PNG", "JPEG"][i], 12.0, true) + 32.0).ceil()
+    /// 分段按钮里一段的宽：文字 + 左右各 16
+    fn seg_w(&self, t: &str) -> f32 {
+        (self.tw(t, 12.0, true) + 32.0).ceil()
+    }
+
+    fn fps_index(&self) -> usize {
+        FPS_CHOICES.iter().position(|f| *f == self.fps).unwrap_or(1)
     }
 
     /// 输入框的外框（DIP）
     fn field_dip(&self, c: Child) -> (f32, f32, f32, f32) {
         match c {
-            Child::Hotkey => (CX, ROW0, RIGHT, ROW0 + 28.0),
+            Child::Hotkey | Child::RecHotkey => (CX, ROW0, RIGHT, ROW0 + 28.0),
             Child::SaveDir => (CX, ROW0, RIGHT - 8.0 - self.btn_w("浏览…", false), ROW0 + 28.0),
             Child::Hex => (CX + 47.0, PICK_Y + 159.0, CX + 143.0, PICK_Y + 187.0),
             Child::Endpoint => (CX, 58.0, RIGHT, 86.0),
@@ -337,9 +368,10 @@ impl Ui {
 
     /// 当前页能点的自绘控件和位置
     fn ctls(&self) -> Vec<(Ctl, Rect)> {
-        let mut v: Vec<(Ctl, Rect)> = (0..4).map(|i| (Ctl::Nav(i), self.rect(8.0, 12.0 + 36.0 * i as f32, NAV_W - 8.0, 46.0 + 36.0 * i as f32))).collect();
+        let mut v: Vec<(Ctl, Rect)> =
+            (0..PAGES.len()).map(|i| (Ctl::Nav(i), self.rect(8.0, 12.0 + 36.0 * i as f32, NAV_W - 8.0, 46.0 + 36.0 * i as f32))).collect();
         match self.page {
-            0 => {
+            SHOT_PAGE => {
                 v.push((Ctl::Toggle, self.rect(CX, 124.0, CX + 40.0, 144.0)));
                 for i in 0..8 {
                     let x = CX + 30.0 * i as f32;
@@ -350,11 +382,19 @@ impl Ui {
                     v.push((Ctl::Hue, self.rect(CX + 11.0, PICK_Y + 139.0, CX + 211.0, PICK_Y + 151.0)));
                 }
             }
-            1 => {
+            REC_PAGE => {
+                let fw = self.seg_w("30");
+                for i in 0..FPS_CHOICES.len() {
+                    let x = CX + fw * i as f32;
+                    v.push((Ctl::Fps(i), self.rect(x, 126.0, x + fw, 154.0)));
+                }
+                v.push((Ctl::GifFrame, self.rect(CX, 216.0, CX + 40.0, 236.0)));
+            }
+            SAVE_PAGE => {
                 v.push((Ctl::Browse, self.rect(RIGHT - self.btn_w("浏览…", false), ROW0, RIGHT, ROW0 + 28.0)));
-                let w0 = self.seg_w(0);
+                let w0 = self.seg_w("PNG");
                 v.push((Ctl::Format(0), self.rect(CX, 126.0, CX + w0, 154.0)));
-                v.push((Ctl::Format(1), self.rect(CX + w0, 126.0, CX + w0 + self.seg_w(1), 154.0)));
+                v.push((Ctl::Format(1), self.rect(CX + w0, 126.0, CX + w0 + self.seg_w("JPEG"), 154.0)));
             }
             OCR_PAGE => {
                 v.push((Ctl::Models, self.rect(RIGHT - self.btn_w("选择…", false), 98.0, RIGHT, 126.0)));
@@ -391,9 +431,9 @@ impl Ui {
         self.w.set_field_text(c as usize, t);
     }
 
-    /// 快捷键框里的组合键；没按或者不带 Ctrl、Alt 时为 None
-    fn read_hotkey(&self) -> Option<Hotkey> {
-        let (mods, vk) = self.w.hotkey_field(Child::Hotkey as usize);
+    /// 快捷键框（截图的或录屏的）里的组合键；没按或者不带 Ctrl、Alt 时为 None
+    fn read_hotkey(&self, c: Child) -> Option<Hotkey> {
+        let (mods, vk) = self.w.hotkey_field(c as usize);
         let hk = Hotkey { mods, vk };
         hk.valid().then_some(hk)
     }
@@ -404,7 +444,7 @@ impl Ui {
         let key_cue = format!("保存在{}，不写进配置文件", plat::KEY_STORE);
         for c in CHILDREN {
             let (kind, cue) = match c {
-                Child::Hotkey => (FieldKind::Hotkey, ""),
+                Child::Hotkey | Child::RecHotkey => (FieldKind::Hotkey, ""),
                 Child::SaveDir => (FieldKind::ReadOnly, ""),
                 Child::Hex => (FieldKind::Hex, ""),
                 Child::Endpoint => (FieldKind::Text, "例如 https://api.deepseek.com"),
@@ -416,8 +456,9 @@ impl Ui {
             };
             w.field(c as usize, kind, cue);
         }
-        let hk = self.orig.hotkey;
-        w.set_hotkey_field(Child::Hotkey as usize, hk.mods, hk.vk);
+        for (c, hk) in [(Child::Hotkey, self.orig.hotkey), (Child::RecHotkey, self.orig.record_hotkey)] {
+            w.set_hotkey_field(c as usize, hk.mods, hk.vk);
+        }
         let dir = if self.save_dir.is_empty() { plat::pictures_dir() } else { self.save_dir.clone() };
         self.set_text(Child::SaveDir, &dir);
         // 没配过服务就填好 DeepSeek，只差 API Key
@@ -510,6 +551,8 @@ impl Ui {
             }
             Ctl::Swatch(_) => self.set_picker(!self.picker),
             Ctl::Format(i) => self.format = if i == 0 { Format::Png } else { Format::Jpeg },
+            Ctl::Fps(i) => self.fps = FPS_CHOICES[i],
+            Ctl::GifFrame => self.gif_frame = !self.gif_frame,
             Ctl::Test => self.start_test(),
             Ctl::Models => self.start_models(),
             Ctl::Browse => self.browse(),
@@ -525,13 +568,14 @@ impl Ui {
     fn order(&self) -> Vec<Focus> {
         let mut v = vec![Focus::Ctl(Ctl::Nav(self.page))];
         match self.page {
-            0 => {
+            SHOT_PAGE => {
                 v.extend([Focus::Child(Child::Hotkey), Focus::Ctl(Ctl::Toggle), Focus::Ctl(Ctl::Swatch(self.swatch()))]);
                 if self.picker {
                     v.push(Focus::Child(Child::Hex));
                 }
             }
-            1 => v.extend([Focus::Ctl(Ctl::Browse), Focus::Ctl(Ctl::Format(self.format_index()))]),
+            REC_PAGE => v.extend([Focus::Child(Child::RecHotkey), Focus::Ctl(Ctl::Fps(self.fps_index())), Focus::Ctl(Ctl::GifFrame)]),
+            SAVE_PAGE => v.extend([Focus::Ctl(Ctl::Browse), Focus::Ctl(Ctl::Format(self.format_index()))]),
             OCR_PAGE => v.extend([
                 Focus::Child(Child::OcrEndpoint),
                 Focus::Child(Child::OcrModel),
@@ -610,7 +654,7 @@ impl Ui {
                 let d: i32 = if matches!(k, Key::Left | Key::Up) { -1 } else { 1 };
                 match f {
                     Some(Ctl::Nav(i)) => {
-                        let p = (i as i32 + d).rem_euclid(4) as usize;
+                        let p = (i as i32 + d).rem_euclid(PAGES.len() as i32) as usize;
                         self.set_page(p);
                         self.focus_to(Focus::Ctl(Ctl::Nav(p)));
                     }
@@ -626,6 +670,11 @@ impl Ui {
                         let j = usize::from(d > 0);
                         self.format = if j == 0 { Format::Png } else { Format::Jpeg };
                         self.focus_to(Focus::Ctl(Ctl::Format(j)));
+                    }
+                    Some(Ctl::Fps(i)) => {
+                        let j = (i as i32 + d).clamp(0, FPS_CHOICES.len() as i32 - 1) as usize;
+                        self.fps = FPS_CHOICES[j];
+                        self.focus_to(Focus::Ctl(Ctl::Fps(j)));
                     }
                     Some(c @ Ctl::Target) if k == Key::Down => self.menu(c),
                     _ => {}
@@ -730,11 +779,11 @@ impl Ui {
         }
     }
 
-    /// 快捷键有问题：回到第一页，红框加原因，焦点放回快捷键框
-    fn reject_hotkey(&mut self, msg: String) {
-        self.hk_bad = Some(msg);
-        self.set_page(0);
-        self.w.focus_field(Some(Child::Hotkey as usize));
+    /// 快捷键有问题：翻到它那一页，红框加原因，焦点放回那个快捷键框
+    fn reject_hotkey(&mut self, c: Child, msg: String) {
+        self.hk_bad = Some((c, msg));
+        self.set_page(c.page());
+        self.w.focus_field(Some(c as usize));
     }
 
     fn browse(&self) {
@@ -750,20 +799,39 @@ impl Ui {
         });
     }
 
-    /// 「确定」：快捷键先注册，失败就恢复原键、留在窗口里；成功了再统一保存，关窗口，出胶囊
+    /// 「确定」：两个快捷键先注册，有一个失败就都恢复原键、留在窗口里；成功了再统一保存，关窗口，出胶囊
     fn apply(&mut self) {
-        let Some(hk) = self.read_hotkey() else {
-            return self.reject_hotkey("请按下一个组合键，需要包含 Ctrl 或 Alt".into());
-        };
-        let old = self.orig.hotkey;
-        if (hk != old || !plat::hotkey_ok()) && !crate::app::set_hotkey(hk) {
-            if hk != old {
-                crate::app::set_hotkey(old);
+        let need = if cfg!(target_os = "macos") { "需要包含 ⌃、⌥ 或 ⌘" } else { "需要包含 Ctrl 或 Alt" };
+        let mut keys = Vec::new();
+        for c in [Child::Hotkey, Child::RecHotkey] {
+            match self.read_hotkey(c) {
+                Some(hk) => keys.push(hk),
+                None => return self.reject_hotkey(c, format!("请按下一个组合键，{need}")),
             }
-            return self.reject_hotkey(format!("{} 已被其他程序占用，请换一个组合键", hk.name(" + ")));
+        }
+        let (hk, rec) = (keys[0], keys[1]);
+        if hk == rec {
+            return self.reject_hotkey(Child::RecHotkey, "和截图快捷键重复了，请换一个组合键".into());
+        }
+        // 改了的（和原来没注册上的）重新注册；先都注销，两个对调时才不会撞上自己
+        let changed: Vec<_> = [(hotkeys::CAPTURE, self.orig.hotkey, hk, Child::Hotkey), (hotkeys::RECORD, self.orig.record_hotkey, rec, Child::RecHotkey)]
+            .into_iter()
+            .filter(|(id, old, new, _)| new != old || !plat::hotkey_ok(*id))
+            .collect();
+        // 注册 `pick` 选的那个键（新的或原来的），返回第一个没注册上的
+        let register = |pick: fn(&(usize, Hotkey, Hotkey, Child)) -> Hotkey| {
+            changed.iter().for_each(|k| _ = plat::set_hotkey(k.0, 0, 0));
+            changed.iter().filter(|k| !hotkeys::apply(k.0, pick(k))).map(|k| (k.3, pick(k))).collect::<Vec<_>>().first().copied()
+        };
+        if let Some((c, new)) = register(|k| k.2) {
+            register(|k| k.1);
+            return self.reject_hotkey(c, format!("{} 已被其他程序占用，请换一个组合键", new.name(" + ")));
         }
         let new = Settings {
             hotkey: hk,
+            record_hotkey: rec,
+            record_fps: self.fps,
+            gif_frame: self.gif_frame,
             sel_color: self.color,
             save_dir: self.save_dir.clone(),
             save_format: self.format,
@@ -790,7 +858,7 @@ impl Ui {
         if let Err(e) = settings::set(new) {
             errs.push(format!("设置没有写进文件：{e}"));
         }
-        crate::app::refresh_tray();
+        hotkeys::refresh_tray();
         let mon = self.w.monitor();
         self.w.close();
         if errs.is_empty() {
@@ -895,6 +963,45 @@ impl Ui {
             c.text(&l, r.left as f32 + self.px(10.0), ((r.top + r.bottom) as f32 - l.height()) / 2.0, rgb(TEXT));
             ui::icon(c, "chev_down", icon_x, (r.top + r.bottom) as f32 / 2.0 - 7.0 * s, 14.0 * s, rgb(HINT));
         };
+        let focus = self.w.focused_field();
+        // 分段按钮：`rs` 是各段的位置，选中那段浅紫底、紫字
+        let segments = |rs: &[Rect], labels: &[&str], sel: usize| {
+            let (Some(a), Some(b)) = (rs.first(), rs.last()) else { return };
+            let whole = Rect { left: a.left, top: a.top, right: b.right, bottom: a.bottom };
+            frame(&whole, 4.0, Some(0xFFFFFF), LINE, lw);
+            // 选中那段的底色只填在它自己那块，外侧的圆角跟着外框
+            c.push_clip(rf(&rs[sel]));
+            c.fill_round(rectf(whole.left as f32 + lw, whole.top as f32 + lw, whole.right as f32 - lw, whole.bottom as f32 - lw), 3.0 * s, rgb(ACCENT_SOFT));
+            c.pop_clip();
+            for r in &rs[1..] {
+                fill(rectf(r.left as f32, r.top as f32, r.left as f32 + lw, r.bottom as f32), LINE);
+            }
+            for (i, r) in rs.iter().enumerate() {
+                let on = i == sel;
+                let Some(l) = text(labels[i], 12.0, on) else { continue };
+                let x = (r.left + r.right) as f32 / 2.0 - l.width() / 2.0;
+                c.text(&l, x.round(), ((r.top + r.bottom) as f32 / 2.0 - l.height() / 2.0).round(), rgb(if on { ACCENT } else { TEXT }));
+            }
+        };
+        // 开关：开是主题色底、白点在右，关是白底灰边、灰点在左；右边一行说明，和标签 `row` 对齐
+        let switch = |ctl: Ctl, on: bool, note: &str, row: f32| {
+            let Some(r) = self.ctl_rect(ctl) else { return };
+            frame(&r, 10.0, Some(if on { ACCENT } else { 0xFFFFFF }), if on { ACCENT } else { 0x8A8590 }, lw);
+            let cx = r.left as f32 + if on { 29.0 } else { 9.0 } * s;
+            c.fill_ellipse(cx, (r.top + r.bottom) as f32 / 2.0, 5.0 * s, 5.0 * s, rgb(if on { 0xFFFFFF } else { HINT }));
+            put_mid(note, 12.0, false, r.right as f32 + self.px(8.0), self.px(row), self.px(row + 28.0), HINT);
+        };
+        // 快捷键框下面那行字
+        let hotkey_hint = |ch: Child, orig: Hotkey| {
+            let changed = self.read_hotkey(ch).is_some_and(|h| h != orig);
+            let (msg, color) = match &self.hk_bad {
+                Some((bad, m)) if *bad == ch => (m.as_str(), ERR),
+                _ if focus == Some(ch as usize) => (if cfg!(target_os = "macos") { "请按下新的组合键，需要包含 ⌃、⌥ 或 ⌘" } else { "请按下新的组合键，需要包含 Ctrl 或 Alt" }, HINT),
+                _ if changed => ("点「确定」后生效", HINT),
+                _ => ("点一下输入框，再按新的组合键", HINT),
+            };
+            hint(msg, self.px(CX), self.px(ROW0 + 34.0), color);
+        };
         // 「测试连接」和右边的结果：翻译页、文字识别页共用
         let test_row = || -> Option<()> {
             button(Ctl::Test, "测试连接", false);
@@ -932,26 +1039,12 @@ impl Ui {
         }
         // 页标题
         put(PAGES[self.page], 18.0, true, self.px(LX), self.px(18.0), TEXT);
-        let focus = self.w.focused_field();
         match self.page {
-            0 => {
+            SHOT_PAGE => {
                 label("快捷键", ROW0);
-                let changed = self.read_hotkey().is_some_and(|h| h != self.orig.hotkey);
-                let (msg, color) = match &self.hk_bad {
-                    Some(m) => (m.as_str(), ERR),
-                    None if focus == Some(Child::Hotkey as usize) => ("请按下新的组合键，需要包含 Ctrl 或 Alt", HINT),
-                    None if changed => ("点「确定」后生效", HINT),
-                    None => ("点一下输入框，再按新的组合键", HINT),
-                };
-                hint(msg, self.px(CX), self.px(ROW0 + 34.0), color);
+                hotkey_hint(Child::Hotkey, self.orig.hotkey);
                 label("开机启动", 120.0);
-                if let Some(r) = self.ctl_rect(Ctl::Toggle) {
-                    let on = self.autostart;
-                    frame(&r, 10.0, Some(if on { ACCENT } else { 0xFFFFFF }), if on { ACCENT } else { 0x8A8590 }, lw);
-                    let cx = r.left as f32 + if on { 29.0 } else { 9.0 } * s;
-                    c.fill_ellipse(cx, (r.top + r.bottom) as f32 / 2.0, 5.0 * s, 5.0 * s, rgb(if on { 0xFFFFFF } else { HINT }));
-                    put_mid("开机时自动启动 Jie", 12.0, false, r.right as f32 + self.px(8.0), self.px(120.0), self.px(148.0), HINT);
-                }
+                switch(Ctl::Toggle, self.autostart, "开机时自动启动 Jie", 120.0);
                 put("选区颜色", 12.0, false, self.px(LX), self.px(SW_Y + 5.0), TEXT);
                 let cur = self.swatch();
                 for i in 0..8 {
@@ -980,28 +1073,39 @@ impl Ui {
                     self.draw_picker(c, lw)?;
                     y = PICK_Y + 198.0 + 6.0;
                 }
-                hint("用在选区边框、手柄、窗口高亮、选中标注的虚线框和钉图描边上", self.px(CX), self.px(y), HINT);
+                hint("用在选区边框、手柄、窗口高亮、录屏边框、选中标注的虚线框和钉图描边上", self.px(CX), self.px(y), HINT);
             }
-            1 => {
+            REC_PAGE => {
+                label("快捷键", ROW0);
+                hotkey_hint(Child::RecHotkey, self.orig.record_hotkey);
+                label("帧率", 126.0);
+                let mut rs = Vec::new();
+                for i in 0..FPS_CHOICES.len() {
+                    rs.extend(self.ctl_rect(Ctl::Fps(i)));
+                }
+                let labels: Vec<String> = FPS_CHOICES.iter().map(|f| f.to_string()).collect();
+                segments(&rs, &labels.iter().map(String::as_str).collect::<Vec<_>>(), self.fps_index());
+                if let Some(b) = rs.last() {
+                    put_mid("帧 / 秒", 12.0, false, b.right as f32 + self.px(8.0), b.top as f32, b.bottom as f32, HINT);
+                }
+                hint("帧率越高越流畅，GIF 文件也越大。区域大、画面变化多时，实际帧率会低一些。", self.px(CX), self.px(160.0), HINT);
+                label("动图边框", 212.0);
+                switch(Ctl::GifFrame, self.gif_frame, "录好的 GIF 钉在屏幕上时，外面画一圈选区颜色的框", 212.0);
+                hint(
+                    "按快捷键后框选要录的区域（可以吸附窗口和页面里的边界），点「开始录制」马上开始，旁边的秒表按钮可以选延时 3、5、10 秒；\
+                     录制中再按一次快捷键，或点控制条上的「停止」。录好的 GIF 在原位置播放，可以复制、保存或钉在屏幕上。",
+                    self.px(CX),
+                    self.px(262.0),
+                    HINT,
+                );
+            }
+            SAVE_PAGE => {
                 label("默认位置", ROW0);
                 button(Ctl::Browse, "浏览…", false);
                 hint("每次保存后会自动记成上次用的文件夹", self.px(CX), self.px(98.0), HINT);
                 label("格式", 126.0);
                 if let (Some(a), Some(b)) = (self.ctl_rect(Ctl::Format(0)), self.ctl_rect(Ctl::Format(1))) {
-                    let whole = Rect { left: a.left, top: a.top, right: b.right, bottom: a.bottom };
-                    frame(&whole, 4.0, Some(0xFFFFFF), LINE, lw);
-                    let on = if self.format == Format::Png { a } else { b };
-                    // 选中那段的底色只填在它自己那半，外侧的圆角跟着外框
-                    c.push_clip(rf(&on));
-                    c.fill_round(rectf(whole.left as f32 + lw, whole.top as f32 + lw, whole.right as f32 - lw, whole.bottom as f32 - lw), 3.0 * s, rgb(ACCENT_SOFT));
-                    c.pop_clip();
-                    fill(rectf(b.left as f32, a.top as f32, b.left as f32 + lw, a.bottom as f32), LINE);
-                    for (i, r) in [a, b].iter().enumerate() {
-                        let sel = i == self.format_index();
-                        let Some(l) = text(["PNG", "JPEG"][i], 12.0, sel) else { continue };
-                        let x = (r.left + r.right) as f32 / 2.0 - l.width() / 2.0;
-                        c.text(&l, x.round(), ((r.top + r.bottom) as f32 / 2.0 - l.height() / 2.0).round(), rgb(if sel { ACCENT } else { TEXT }));
-                    }
+                    segments(&[a, b], &["PNG", "JPEG"], self.format_index());
                     put_mid("JPEG 质量固定 90", 12.0, false, b.right as f32 + self.px(8.0), b.top as f32, b.bottom as f32, HINT);
                 }
             }
@@ -1034,7 +1138,7 @@ impl Ui {
         // 系统控件的外框（画在页面内容之后，取色器的底色才不会盖住色值框）：平时 1px，聚焦时 2px 主题色，快捷键有问题时 2px 红
         for ch in CHILDREN.into_iter().filter(|ch| self.visible(*ch)) {
             let r = self.field(ch);
-            let bad = ch == Child::Hotkey && self.hk_bad.is_some();
+            let bad = self.hk_bad.as_ref().is_some_and(|(c, _)| *c == ch);
             let (line, width) = if bad {
                 (ERR, 2.0 * lw)
             } else if focus == Some(ch as usize) {
@@ -1060,7 +1164,7 @@ impl Ui {
             let o = Rect { left: r.left - g as i32, top: r.top - g as i32, right: r.right + g as i32, bottom: r.bottom + g as i32 };
             let radius = match ctl {
                 Ctl::Swatch(_) => 16.0,
-                Ctl::Toggle => 12.0,
+                Ctl::Toggle | Ctl::GifFrame => 12.0,
                 _ => 6.0,
             };
             frame(&o, radius, None, ACCENT, g);
@@ -1162,7 +1266,7 @@ impl Handler for Ui {
             Event::FieldKey { key, shift } => self.key(key, shift, false),
             Event::FieldChanged(id) => {
                 match CHILDREN.into_iter().find(|c| *c as usize == id) {
-                    Some(Child::Hotkey) => self.hk_bad = None,
+                    Some(Child::Hotkey | Child::RecHotkey) => self.hk_bad = None,
                     Some(Child::Hex) if !self.syncing => {
                         if let Some(c) = parse_hex(&self.text(Child::Hex)) {
                             self.color = c;
@@ -1267,7 +1371,7 @@ mod tests {
         use crate::translate::tests::{http, mock};
 
         let (w, ui, dir) = open("settings");
-        ui.set_page(3);
+        ui.set_page(TR_PAGE);
         assert_eq!((ui.text(Child::Endpoint).as_str(), ui.text(Child::Model).as_str()), (translate::DEEPSEEK, translate::DEEPSEEK_MODEL));
 
         // 菜单弹出来以后另一个线程截屏，再按 ↓↓ Enter 选第二个
@@ -1338,8 +1442,39 @@ mod tests {
         shoot(w.rect(), &dir.join("4-no-image.png"));
 
         // 翻页再回来，测试结果清掉
-        w.with(|ui: &mut Ui| ui.set_page(3));
+        w.with(|ui: &mut Ui| ui.set_page(TR_PAGE));
         assert!(matches!(ui.test, Test::Idle));
+        w.close();
+    }
+
+    /// 录屏页：截图存 target/test-tmp/settings-rec；录屏快捷键和截图的一样时「确定」被拦下（这时还没注册任何快捷键），
+    /// 翻到录屏页、红框标在录屏快捷键上；帧率分段可以用方向键换。平时不跑：cargo test record_page -- --ignored
+    #[test]
+    #[ignore]
+    fn record_page() {
+        let (w, ui, dir) = open("settings-rec");
+        w.with(|ui: &mut Ui| ui.set_page(REC_PAGE));
+        let t0 = Instant::now();
+        wait(ui, |_| t0.elapsed() > Duration::from_millis(300));
+        shoot(w.rect(), &dir.join("1-page.png"));
+        assert!(ui.visible(Child::RecHotkey) && !ui.visible(Child::Hotkey));
+        assert_eq!(ui.fps, 15);
+        w.with(|ui: &mut Ui| {
+            ui.focus = Some(Ctl::Fps(1));
+            ui.key(Key::Right, false, true);
+        });
+        assert_eq!(ui.fps, 20);
+        let hk = ui.orig.hotkey;
+        w.set_hotkey_field(Child::RecHotkey as usize, hk.mods, hk.vk);
+        w.with(|ui: &mut Ui| {
+            ui.set_page(SHOT_PAGE);
+            ui.apply();
+        });
+        assert!(matches!(&ui.hk_bad, Some((Child::RecHotkey, m)) if m.contains("重复")));
+        assert_eq!(ui.page, REC_PAGE);
+        let t0 = Instant::now();
+        wait(ui, |_| t0.elapsed() > Duration::from_millis(200));
+        shoot(w.rect(), &dir.join("2-duplicate.png"));
         w.close();
     }
 }

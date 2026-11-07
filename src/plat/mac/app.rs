@@ -20,7 +20,8 @@ use std::sync::{
 };
 
 static APP: OnceLock<App> = OnceLock::new();
-static HOTKEY_OK: AtomicBool = AtomicBool::new(false);
+/// 各个全局快捷键（按编号 1–4）现在是否注册成功
+static HOTKEY_OK: [AtomicBool; 4] = [const { AtomicBool::new(false) }; 4];
 static TIP: Mutex<String> = Mutex::new(String::new());
 
 #[derive(Default)]
@@ -43,10 +44,10 @@ define_class!(
         #[unsafe(method(capture:))]
         fn capture(&self, _sender: Option<&AnyObject>) {
             let right = MainThreadMarker::new().and_then(|m| NSApplication::sharedApplication(m).currentEvent()).is_some_and(|e| e.r#type() == NSEventType::RightMouseUp || e.modifierFlags().contains(NSEventModifierFlags::Control));
-            if let Some(a) = APP.get() { if right { (a.tray_menu)(crate::plat::cursor_pos()); } else { (a.capture)(); } }
+            if let Some(a) = APP.get() { if right { (a.tray_menu)(crate::plat::cursor_pos()); } else { (a.tray_click)(); } }
         }
         #[unsafe(method(menuAction:))]
-        fn menu_action(&self, sender: &NSMenuItem) { if let Some(a) = APP.get() { let _ = sender; let id = sender.tag(); if id != 0 { menu_result(id as usize); } else { (a.capture)(); } } }
+        fn menu_action(&self, sender: &NSMenuItem) { if let Some(a) = APP.get() { let id = sender.tag(); if id != 0 { menu_result(id as usize); } else { (a.tray_click)(); } } }
     }
 );
 
@@ -187,18 +188,43 @@ unsafe extern "C" {
         out: *mut *mut std::ffi::c_void,
     ) -> i32;
     fn UnregisterEventHotKey(hot_key: *mut std::ffi::c_void) -> i32;
+    fn GetEventParameter(
+        event: *mut std::ffi::c_void,
+        name: u32,
+        desired: u32,
+        actual: *mut u32,
+        size: usize,
+        actual_size: *mut usize,
+        data: *mut std::ffi::c_void,
+    ) -> i32;
 }
 
 const SHIFT_KEY: u32 = 1 << 9;
 const CONTROL_KEY: u32 = 1 << 12;
 const COMMAND_KEY: u32 = 1 << 8;
 const OPTION_KEY: u32 = 1 << 11;
-static HOTKEY_REF: std::sync::atomic::AtomicPtr<std::ffi::c_void> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+static HOTKEY_REF: [std::sync::atomic::AtomicPtr<std::ffi::c_void>; 4] = [const { std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()) }; 4];
 static EVENT_INSTALLED: AtomicBool = AtomicBool::new(false);
 
-extern "C" fn carbon_hotkey(_: *mut std::ffi::c_void, _: *mut std::ffi::c_void, _: *mut std::ffi::c_void) -> i32 {
-    if let Some(app) = APP.get() {
-        (app.capture)();
+/// 按下了注册过的快捷键：从事件里读出注册时给的编号
+extern "C" fn carbon_hotkey(_: *mut std::ffi::c_void, event: *mut std::ffi::c_void, _: *mut std::ffi::c_void) -> i32 {
+    let mut id = EventHotKeyID { signature: 0, id: 0 };
+    // kEventParamDirectObject（'----'）、typeEventHotKeyID（'hkid'）
+    let got = unsafe {
+        GetEventParameter(
+            event,
+            u32::from_be_bytes(*b"----"),
+            u32::from_be_bytes(*b"hkid"),
+            std::ptr::null_mut(),
+            size_of::<EventHotKeyID>(),
+            std::ptr::null_mut(),
+            &mut id as *mut _ as *mut std::ffi::c_void,
+        )
+    };
+    if got == 0
+        && let Some(app) = APP.get()
+    {
+        (app.hotkey)(id.id as usize);
     }
     0
 }
@@ -258,23 +284,26 @@ pub(crate) fn carbon_key(vk: u32) -> Option<u32> {
     })
 }
 
-pub fn set_hotkey(mods: u32, vk: u32) -> bool {
-    let old = HOTKEY_REF.swap(std::ptr::null_mut(), Ordering::AcqRel);
+/// 换编号 `id`（1–4）的全局快捷键（先注销旧的）；返回是否注册成功。按下时调 `App::hotkey(id)`
+pub fn set_hotkey(id: usize, mods: u32, vk: u32) -> bool {
+    use crate::plat::{MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_WIN};
+    let (Some(slot), Some(ok_slot)) = (HOTKEY_REF.get(id.wrapping_sub(1)), HOTKEY_OK.get(id.wrapping_sub(1))) else { return false };
+    let old = slot.swap(std::ptr::null_mut(), Ordering::AcqRel);
     if !old.is_null() {
         unsafe {
             let _ = UnregisterEventHotKey(old);
         }
     }
     let Some(code) = carbon_key(vk) else {
-        HOTKEY_OK.store(false, Ordering::Release);
+        ok_slot.store(false, Ordering::Release);
         return false;
     };
-    let carbon_mods = (if mods & crate::settings::MOD_ALT != 0 { OPTION_KEY } else { 0 })
-        | (if mods & crate::settings::MOD_SHIFT != 0 { SHIFT_KEY } else { 0 })
-        | (if mods & crate::settings::MOD_CONTROL != 0 { CONTROL_KEY } else { 0 })
-        | (if mods & crate::settings::MOD_WIN != 0 { COMMAND_KEY } else { 0 });
+    let carbon_mods = (if mods & MOD_ALT != 0 { OPTION_KEY } else { 0 })
+        | (if mods & MOD_SHIFT != 0 { SHIFT_KEY } else { 0 })
+        | (if mods & MOD_CONTROL != 0 { CONTROL_KEY } else { 0 })
+        | (if mods & MOD_WIN != 0 { COMMAND_KEY } else { 0 });
     if carbon_mods == 0 {
-        HOTKEY_OK.store(false, Ordering::Release);
+        ok_slot.store(false, Ordering::Release);
         return false;
     }
     unsafe {
@@ -283,24 +312,23 @@ pub fn set_hotkey(mods: u32, vk: u32) -> bool {
             let mut handler = std::ptr::null_mut();
             if InstallEventHandler(GetApplicationEventTarget(), carbon_hotkey, 1, &spec, std::ptr::null_mut(), &mut handler) != 0 {
                 EVENT_INSTALLED.store(false, Ordering::Release);
-                HOTKEY_OK.store(false, Ordering::Release);
+                ok_slot.store(false, Ordering::Release);
                 return false;
             }
         }
         let mut ref_ = std::ptr::null_mut();
-        let result =
-            RegisterEventHotKey(code, carbon_mods, EventHotKeyID { signature: u32::from_be_bytes(*b"Jie "), id: 1 }, GetApplicationEventTarget(), 0, &mut ref_);
-        let ok = result == 0;
+        let hk_id = EventHotKeyID { signature: u32::from_be_bytes(*b"Jie "), id: id as u32 };
+        let ok = RegisterEventHotKey(code, carbon_mods, hk_id, GetApplicationEventTarget(), 0, &mut ref_) == 0;
         if ok {
-            HOTKEY_REF.store(ref_, Ordering::Release);
+            slot.store(ref_, Ordering::Release);
         }
-        HOTKEY_OK.store(ok, Ordering::Release);
+        ok_slot.store(ok, Ordering::Release);
         ok
     }
 }
 
-pub fn hotkey_ok() -> bool {
-    HOTKEY_OK.load(Ordering::Relaxed)
+pub fn hotkey_ok(id: usize) -> bool {
+    HOTKEY_OK.get(id.wrapping_sub(1)).is_some_and(|s| s.load(Ordering::Relaxed))
 }
 
 pub fn add_tray(tip: &str) {

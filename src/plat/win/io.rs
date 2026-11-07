@@ -1,7 +1,7 @@
 //! WIC 编码和缩放、剪贴板、保存和选文件夹对话框。
 
 use super::Bitmap;
-use crate::plat::Image;
+use crate::plat::{Image, SaveAs};
 use std::path::PathBuf;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::{BI_RGB, BITMAPV5HEADER};
@@ -10,7 +10,8 @@ use windows::Win32::System::Com::StructuredStorage::*;
 use windows::Win32::System::Com::*;
 use windows::Win32::System::DataExchange::*;
 use windows::Win32::System::Memory::*;
-use windows::Win32::System::Ole::{CF_DIBV5, CF_UNICODETEXT};
+use std::os::windows::ffi::OsStrExt;
+use windows::Win32::System::Ole::{CF_DIBV5, CF_HDROP, CF_UNICODETEXT};
 use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::{CreateWindowExW, HWND_MESSAGE, WINDOW_EX_STYLE, WINDOW_STYLE};
@@ -125,6 +126,27 @@ pub fn copy_image(img: &Image) -> std::result::Result<(), String> {
     }
 }
 
+/// 复制文件（资源管理器里「复制」一样）：CF_HDROP 加「首选放置效果 = 复制」。聊天软件、浏览器、资源管理器粘贴的是这个文件，
+/// 动图就靠它粘贴（剪贴板没有通用的动图格式）；文件要一直留着，粘贴时才读
+pub fn copy_file(path: &std::path::Path) -> std::result::Result<(), String> {
+    // DROPFILES 头后面是 UTF-16 的路径，以两个 0 结尾
+    let head = DROPFILES { pFiles: size_of::<DROPFILES>() as u32, fWide: TRUE, ..Default::default() };
+    let mut bytes = unsafe { std::slice::from_raw_parts(&head as *const _ as *const u8, size_of::<DROPFILES>()) }.to_vec();
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0, 0]).collect();
+    bytes.extend(wide.iter().flat_map(|c| c.to_le_bytes()));
+    let effect = 1u32.to_le_bytes(); // DROPEFFECT_COPY
+    unsafe {
+        OpenClipboard(Some(owner())).map_err(|e| e.message())?;
+        let r = EmptyClipboard().and_then(|_| {
+            set_clip(CF_HDROP.0 as u32, &bytes)?;
+            let _ = set_clip(RegisterClipboardFormatW(w!("Preferred DropEffect")), &effect);
+            Ok(())
+        });
+        let _ = CloseClipboard();
+        r.map_err(|e| e.message())
+    }
+}
+
 /// 复制文字：CF_UNICODETEXT，换行换成 \r\n（老程序只认这种）
 pub fn copy_text(text: &str) -> std::result::Result<(), String> {
     let w: Vec<u16> = text.replace('\n', "\r\n").encode_utf16().chain([0]).collect();
@@ -192,22 +214,23 @@ fn shell_item(path: &str) -> Option<IShellItem> {
     unsafe { SHCreateItemFromParsingName(&HSTRING::from(path), None).ok() }
 }
 
-/// 系统保存对话框：PNG 或 JPEG，从 `dir` 开始、默认文件名 `name`（不带扩展名）。取消时返回 None
-pub fn ask_save_path(owner: HWND, dir: &str, name: &str, jpeg: bool) -> Option<PathBuf> {
+/// 系统保存对话框：PNG、JPEG 时两种都能选（默认 `kind`），GIF 只能存 GIF；从 `dir` 开始、默认文件名 `name`（不带扩展名）。
+/// 取消时返回 None
+pub fn ask_save_path(owner: HWND, dir: &str, name: &str, kind: SaveAs) -> Option<PathBuf> {
     unsafe {
         let dlg: IFileSaveDialog = CoCreateInstance(&FileSaveDialog, None, CLSCTX_INPROC_SERVER).ok()?;
-        let types = [
+        let images = [
             COMDLG_FILTERSPEC { pszName: w!("PNG 图片"), pszSpec: w!("*.png") },
             COMDLG_FILTERSPEC { pszName: w!("JPEG 图片"), pszSpec: w!("*.jpg;*.jpeg") },
         ];
-        dlg.SetFileTypes(&types).ok()?;
-        dlg.SetFileTypeIndex(if jpeg { 2 } else { 1 }).ok()?;
-        dlg.SetDefaultExtension(if jpeg { w!("jpg") } else { w!("png") }).ok()?;
+        let gif = [COMDLG_FILTERSPEC { pszName: w!("GIF 动图"), pszSpec: w!("*.gif") }];
+        dlg.SetFileTypes(if kind == SaveAs::Gif { &gif[..] } else { &images[..] }).ok()?;
+        dlg.SetFileTypeIndex(if kind == SaveAs::Jpeg { 2 } else { 1 }).ok()?;
+        dlg.SetDefaultExtension(&HSTRING::from(kind.ext())).ok()?;
         if let Some(dir) = shell_item(dir) {
             let _ = dlg.SetFolder(&dir);
         }
-        let ext = if jpeg { "jpg" } else { "png" };
-        dlg.SetFileName(&HSTRING::from(format!("{name}.{ext}"))).ok()?;
+        dlg.SetFileName(&HSTRING::from(format!("{name}.{}", kind.ext()))).ok()?;
         let opts = dlg.GetOptions().ok()?;
         dlg.SetOptions(opts | FOS_OVERWRITEPROMPT | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST).ok()?;
         dlg.Show(Some(owner)).ok()?;

@@ -6,6 +6,7 @@ mod field;
 mod gfx;
 mod io;
 mod menu;
+mod record;
 mod screen;
 mod store;
 mod window;
@@ -19,7 +20,8 @@ pub(crate) use gfx::d2d;
 pub(crate) use menu::{menu_draw, menu_measure, popup_menu};
 #[cfg(test)]
 pub use menu::answer_menu;
-pub use io::{ask_folder, ask_save_path, copy_image, copy_text, encode, paste_text, scale_down};
+pub use io::{ask_folder, ask_save_path, copy_file, copy_image, copy_text, encode, paste_text, scale_down};
+pub use record::{Recording, record};
 pub use screen::{capture_cursor_monitor, cursor_pos, monitor_at, window_rects};
 pub use window::Win;
 #[cfg(test)]

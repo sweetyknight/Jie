@@ -1,6 +1,7 @@
 //! 平台层：只有 win/、mac/ 能调系统 API，功能模块只用这里导出的类型和函数。
 //! 两个平台导出同一组名字（按 cfg 选一个），签名对不上时编译另一个平台就会报错。
 //! 纯数据的类型（Rect、Point）在 Windows 上直接是 Win32 的同名结构，免得来回转换。
+//! 平台层不依赖任何功能模块。
 
 #[cfg(windows)]
 mod win;
@@ -15,8 +16,10 @@ pub use mac::*;
 pub struct App {
     /// 主窗口、托盘都建好以后调一次
     pub start: fn(),
-    /// 按了全局快捷键、单击了托盘图标
-    pub capture: fn(),
+    /// 按了全局快捷键：注册时给的编号（`set_hotkey` 的 `id`）
+    pub hotkey: fn(usize),
+    /// 单击了托盘图标
+    pub tray_click: fn(),
     /// 右键托盘图标：在屏幕坐标这里弹菜单
     pub tray_menu: fn(Point),
     /// 又启动了一个 Jie：提示「已经在运行」
@@ -25,6 +28,45 @@ pub struct App {
     pub notify: fn(&str, &str, Option<fn()>),
 }
 
+// 全局快捷键的修饰键位，就是 Windows RegisterHotKey 的 MOD_*；mac 把 MOD_WIN 当 ⌘。两个平台读同一份配置
+pub const MOD_ALT: u32 = 1;
+pub const MOD_CONTROL: u32 = 2;
+pub const MOD_SHIFT: u32 = 4;
+pub const MOD_WIN: u32 = 8;
+
+/// 组合键的名字：Windows 是「Alt + Shift + A」（顺序同系统：Ctrl、Alt、Shift，`sep` 是连接符），mac 是「⌥⇧A」
+pub fn hotkey_name(mods: u32, vk: u32, sep: &str) -> String {
+    let names: &[(u32, &str)] = if cfg!(target_os = "macos") {
+        &[(MOD_CONTROL, "⌃"), (MOD_ALT, "⌥"), (MOD_SHIFT, "⇧"), (MOD_WIN, "⌘")]
+    } else {
+        &[(MOD_CONTROL, "Ctrl"), (MOD_ALT, "Alt"), (MOD_SHIFT, "Shift")]
+    };
+    let mut v: Vec<String> = names.iter().filter(|(m, _)| mods & m != 0).map(|(_, n)| n.to_string()).collect();
+    v.push(key_name(vk));
+    v.join(if cfg!(target_os = "macos") { "" } else { sep })
+}
+
+/// 保存对话框的文件类型
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SaveAs {
+    Png,
+    Jpeg,
+    Gif,
+}
+
+impl SaveAs {
+    pub fn ext(self) -> &'static str {
+        match self {
+            SaveAs::Png => "png",
+            SaveAs::Jpeg => "jpg",
+            SaveAs::Gif => "gif",
+        }
+    }
+}
+
+/// 录屏截到一帧时的回调，在截屏线程上调：BGRA 像素（自上而下，每行 `stride` 字节，宽高就是录制区域的大小，
+/// alpha 不保证是 255）、从开始录制算起的时间。`record` 返回的 `Recording::stop` 之后不会再调
+pub type OnFrame = Box<dyn FnMut(&[u8], usize, std::time::Duration) + Send>;
 /// 一个菜单项；`id` 为 0 表示分组线
 pub struct MenuItem<'a> {
     pub id: usize,
@@ -65,6 +107,10 @@ pub enum Kind {
     Toast,
     /// 设置：普通窗口，有标题栏和关闭按钮
     Settings,
+    /// 录屏区域的边框、倒计时：透明、鼠标穿透、不抢焦点（放在录制区域里时要调 `hide_from_capture`）
+    RecFrame,
+    /// 录屏控制条：透明处鼠标穿透、不抢焦点（放在录制区域里时要调 `hide_from_capture`）
+    RecBar,
 }
 
 /// 建窗口的参数。`rect` 是窗口在桌面上的位置（物理像素）；设置窗口给的是内容区，标题栏另加

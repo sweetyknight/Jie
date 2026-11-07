@@ -1,10 +1,11 @@
-//! 钉图编辑的操作栏窗口：贴在钉图旁边的透明小窗口，画操作栏、工具选项条和工具提示，位置规则同截图。
+//! 钉图的操作栏窗口：贴在钉图旁边的透明小窗口，画操作栏、工具选项条和工具提示，位置规则同截图。
+//! 编辑标注时是编辑的按钮（主按钮「完成」），录屏结果下面是结果条（主按钮「复制」）。
 //! 不抢焦点，键盘一直在钉图上；透明的地方鼠标穿透。钉图每次变了把编辑器的样子交过来（`place`），点了按钮交回钉图处理。
 
 use super::Pin;
 use crate::annotate::{Editor, Kind};
-use crate::overlay::bar::{Act, Bar};
-use crate::overlay::opts::{self, Item, Opts};
+use crate::toolbar::opts::{self, Item, Opts};
+use crate::toolbar::{self, Act, Bar, Items, act_of};
 use crate::plat::{self, Affine, Button, Canvas, Event, Face, Handler, Point, Rect, Spec, Text, Win};
 use crate::ui::{self, Hud};
 
@@ -30,13 +31,15 @@ struct Look {
 
 impl Look {
     fn of(ed: &Editor) -> Look {
-        Look { tool: ed.tool.map(crate::overlay::act_of), opt: ed.opts(), pen: ed.pen(), undo: ed.doc.can_undo(), redo: ed.doc.can_redo() }
+        Look { tool: ed.tool.map(act_of), opt: ed.opts(), pen: ed.pen(), undo: ed.doc.can_undo(), redo: ed.doc.can_redo() }
     }
 }
 
 pub(super) struct Chrome {
     pin: Win,
-    /// 主按钮的「完成」两个字，按 scale 排的
+    /// 编辑的按钮（PIN）还是录屏结果的（RESULT），主按钮上的字（按 scale 排的）
+    items: &'static Items,
+    main: &'static str,
     label: Text,
     scale: f32,
     look: Look,
@@ -53,15 +56,31 @@ pub(super) struct Chrome {
     origin: Point,
 }
 
-fn label(s: f32) -> Option<Text> {
-    Text::new(Face::Ui, 13.0 * s, true, "完成")
+fn label(s: f32, text: &str) -> Option<Text> {
+    Text::new(Face::Ui, 13.0 * s, true, text)
 }
 
-/// 建操作栏窗口（先不显示，第一次 `place` 时出现）；归钉图所有：总在钉图上面，钉图关掉时跟着销毁
-pub(super) fn open(pin: Win) -> Option<Win> {
+/// 建操作栏窗口（先不显示，第一次 `place` 时出现）；`result`：录屏结果的结果条。归钉图所有：总在钉图上面，钉图关掉时跟着销毁
+pub(super) fn open(pin: Win, result: bool) -> Option<Win> {
     let scale = pin.scale();
-    let c = Chrome { pin, label: label(scale)?, scale, look: Look::default(), img: Rect::default(), hot: None, down: None, tip: None, bar: None, opts: None, hud: None, origin: Point::default() };
-    Win::open(Spec { kind: plat::Kind::PinBar, rect: Rect::default(), title: "Jie 钉图编辑", owner: Some(pin) }, c)
+    let (items, main): (&'static Items, _) = if result { (&toolbar::RESULT, "复制") } else { (&toolbar::PIN, "完成") };
+    let c = Chrome {
+        pin,
+        items,
+        main,
+        label: label(scale, main)?,
+        scale,
+        look: Look::default(),
+        img: Rect::default(),
+        hot: None,
+        down: None,
+        tip: None,
+        bar: None,
+        opts: None,
+        hud: None,
+        origin: Point::default(),
+    };
+    Win::open(Spec { kind: plat::Kind::PinBar, rect: Rect::default(), title: "Jie 钉图操作栏", owner: Some(pin) }, c)
 }
 
 /// 按钉图的图片区域 `img`（屏幕坐标）和编辑器现在的样子摆好、重画并显示
@@ -88,7 +107,7 @@ impl Chrome {
         let s = mon.scale();
         // 钉图拖到了缩放比例不同的显示器上
         if s != self.scale
-            && let Some(l) = label(s)
+            && let Some(l) = label(s, self.main)
         {
             (self.label, self.scale) = (l, s);
         }
@@ -98,7 +117,7 @@ impl Chrome {
         let px = |dip: f32| (dip * s).round() as i32;
         let anchor = Rect { left: img.left - work.left, top: img.top - work.top, right: img.right - work.left, bottom: img.bottom - work.top };
         let opt_h = look.opt.map_or(0, |(k, t)| Opts::size(k, t, s).1 + px(4.0));
-        let bar = Bar::layout(anchor, sw, sh, s, self.label.width(), opt_h, true);
+        let bar = Bar::layout(anchor, sw, sh, s, self.label.width(), opt_h, self.items);
         // 选项条：和操作栏左对齐，在操作栏远离钉图的那一侧（操作栏在钉图里面时放它上方），间距 4
         let opts = look.opt.map(|(kind, trash)| {
             let (ow, oh) = Opts::size(kind, trash, s);
