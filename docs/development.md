@@ -77,7 +77,7 @@ sh scripts/macos/test.sh
 
 **图标「取景框」**（[预览](https://claude.ai/artifact/PWwgR63LbH73esTYzEUD8t) 的 A）：紫底、白色取景框、右下角柠檬黄方块，墨色粗描边和错位实心阴影。三处画的是同一份 100 × 100 网格坐标，改造型要一起改：Windows 的 `scripts/windows/icon.ps1`（exe、托盘、窗口图标都取自 `assets\jie.ico`）；mac 的 `scripts/macos/icon.swift`（紫底铺满整个图标，因为 macOS 26 起不是满版圆角方块的图标会被套进灰底方块）；mac 菜单栏的单色模板图（`src/plat/mac/app.rs` 的 `tray_icon`）。24 像素及以下白框加粗，不然发灰。
 
-**截图和录屏是同一个遮罩**，顶上「截图 | 录屏」模式条，`Tab` 切换；两个快捷键只决定打开时的模式。有标注时不能切到录屏（标注录不进去）。
+**截图和录屏是同一个遮罩**，顶上「截图 | 录屏」模式条，`Tab` 切换（模式条挡着选区、读数或操作栏时挪到屏幕底下，上下都挡就不出）；两个快捷键只决定打开时的模式。有标注时不能切到录屏（标注录不进去）。
 
 **录屏只出 GIF**，两端共用纯 Rust 的 `gif` crate：和上一帧比较只编码变化区域、不超过 256 色用精确调色板、超过用 NeuQuant；帧延迟按时间戳算，画面不变只加长上一帧。边录边写临时文件（Windows `%TEMP%\Jie\`，mac `NSTemporaryDirectory()/Jie/`），丢弃时删、启动时清空。复制到剪贴板的是文件（`CF_HDROP` / 文件 URL），因为没有通用的动图剪贴板格式。截屏：Windows 录制线程 `BitBlt`（不带 `CAPTUREBLT`，带了鼠标可能闪），鼠标自己画；mac 用 `SCStream`。
 

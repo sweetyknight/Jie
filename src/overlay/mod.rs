@@ -453,13 +453,27 @@ impl Overlay {
         Some(Deco::Hud(hud, x, y))
     }
 
-    /// 模式条：工作区顶上 18 处居中；拖选区时收起
+    /// 模式条：工作区顶上 18 处居中；挡着选区（连手柄）、读数或操作栏时挪到工作区底下 18 处，上下都挡就不出；拖选区时收起
     fn mode_bar(&self) -> Option<ModeBar> {
         if self.v.dragging {
             return None;
         }
-        let top = self.mon.work.top - self.mon.rect.top + self.px(18.0) as i32;
-        ModeBar::layout(self.v.mode == Mode::Record, self.frame.w / 2, top, self.mon.scale())
+        let (rec, cx, s, g) = (self.v.mode == Mode::Record, self.frame.w / 2, self.mon.scale(), self.px(18.0) as i32);
+        let m = ModeBar::layout(rec, cx, self.mon.work.top - self.mon.rect.top + g, s)?;
+        let Some(sel) = self.v.sel else { return Some(m) };
+        let bar = self.bar();
+        let busy = [
+            Some(inflate(sel, self.border() + self.px(8.0) as i32)),
+            self.readout().map(|d| d.rect(s)),
+            bar.as_ref().map(|b| b.rect),
+            bar.as_ref().and_then(|b| self.opts(b)).map(|o| o.rect),
+        ];
+        let free = |m: &ModeBar| busy.iter().flatten().all(|r| intersect(r, &m.rect).is_none());
+        if free(&m) {
+            return Some(m);
+        }
+        let m = ModeBar::layout(rec, cx, self.mon.work.bottom - self.mon.rect.top - g - (m.rect.bottom - m.rect.top), s)?;
+        free(&m).then_some(m)
     }
 
     fn decos(&self) -> Vec<Deco> {
@@ -1048,6 +1062,24 @@ mod tests {
         assert!(s.v.mode == Mode::Record && s.ed.tool.is_none());
         key(w, Key::Esc);
         assert!(!w.alive());
+    }
+
+    /// 模式条躲选区：框在它正下面（挡住上边的手柄）就挪到底下，框满整块屏幕就不出。平时不跑：
+    /// cargo test mode_bar_dodges -- --ignored
+    #[test]
+    #[ignore]
+    fn mode_bar_dodges() {
+        let w = open();
+        fill(w, |_, _| [0xF0; 4]);
+        let s = w.peek::<Overlay>();
+        let (fw, fh, top) = (s.frame.w, s.frame.h, s.mode_bar().unwrap().rect);
+        drag(w, (fw / 2 - 200, top.bottom + 2), (fw / 2 + 200, top.bottom + 300));
+        let m = s.mode_bar().unwrap().rect;
+        assert!(m.top > fh / 2 && intersect(&m, &s.v.sel.unwrap()).is_none(), "{m:?}");
+        w.send(Event::Up { button: Button::Right });
+        drag(w, (0, 0), (fw, fh));
+        assert!(s.mode_bar().is_none());
+        w.close();
     }
 
     #[test]
