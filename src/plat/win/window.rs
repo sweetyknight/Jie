@@ -74,19 +74,20 @@ fn class(kind: Kind) -> PCWSTR {
         Kind::Settings => w!("Jie.Settings"),
         Kind::RecFrame => w!("Jie.RecFrame"),
         Kind::RecBar => w!("Jie.RecBar"),
+        Kind::Tray => w!("Jie.Tray"),
     }
 }
 
-/// 透明窗口：整张画好用 UpdateLayeredWindow 贴，没有 WM_PAINT
+/// 透明窗口：整张画好用 UpdateLayeredWindow 贴，没有 WM_PAINT。文字卡片、托盘面板自己画圆角和实心阴影，也是透明窗口
 fn layered(kind: Kind) -> bool {
-    matches!(kind, Kind::PinBar | Kind::Toast | Kind::RecFrame | Kind::RecBar)
+    matches!(kind, Kind::PinBar | Kind::Toast | Kind::RecFrame | Kind::RecBar | Kind::Card | Kind::Tray)
 }
 
 fn styles(kind: Kind) -> (WINDOW_EX_STYLE, WINDOW_STYLE) {
     let pop = WS_EX_TOPMOST | WS_EX_TOOLWINDOW;
     match kind {
-        Kind::Overlay | Kind::Card => (pop, WS_POPUP),
-        Kind::Pin => (pop | WS_EX_LAYERED, WS_POPUP),
+        Kind::Overlay => (pop, WS_POPUP),
+        Kind::Pin | Kind::Card | Kind::Tray => (pop | WS_EX_LAYERED, WS_POPUP),
         Kind::PinBar | Kind::RecBar => (pop | WS_EX_LAYERED | WS_EX_NOACTIVATE, WS_POPUP),
         Kind::Toast | Kind::RecFrame => (pop | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE, WS_POPUP),
         // 设计稿的标题栏只有关闭按钮
@@ -104,7 +105,7 @@ fn register(kind: Kind) {
     unsafe {
         let hinst = GetModuleHandleW(None).unwrap_or_default().into();
         let mut style = CS_DBLCLKS;
-        if matches!(kind, Kind::Pin | Kind::Card) {
+        if kind == Kind::Pin {
             // 系统阴影
             style |= CS_DROPSHADOW;
         }
@@ -181,15 +182,10 @@ impl Win {
                 dwm(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND);
                 let _ = unsafe { SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA) };
             }
-            // 卡片：圆角 8，系统画的那圈边框也用卡片外框的颜色（COLORREF 是 0xBBGGRR）
-            Kind::Card => {
-                dwm(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND);
-                dwm(hwnd, DWMWA_BORDER_COLOR, COLORREF(0xEADEE3));
-            }
-            // 标题栏固定白底：用户开了「在标题栏显示主题色」时也不出现蓝色
+            // 标题栏奶油色、边框墨色，接上自绘内容（COLORREF 是 0xBBGGRR）；用户开了「在标题栏显示主题色」时也不出现蓝色
             Kind::Settings => {
-                dwm(hwnd, DWMWA_CAPTION_COLOR, COLORREF(0xFFFFFF));
-                dwm(hwnd, DWMWA_BORDER_COLOR, COLORREF(0xCEC6C9));
+                dwm(hwnd, DWMWA_CAPTION_COLOR, COLORREF(0xDCF4FF));
+                dwm(hwnd, DWMWA_BORDER_COLOR, COLORREF(0x171315));
             }
             _ => {}
         }
@@ -847,7 +843,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 {
                     *r = nr;
                     st.size.set((r.right - r.left, r.bottom - r.top));
-                    let _ = InvalidateRect(Some(hwnd), None, false);
+                    Win(hwnd.0 as isize).invalidate_all();
                 }
                 settle();
                 return LRESULT(1);

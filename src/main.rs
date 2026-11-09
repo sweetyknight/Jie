@@ -18,6 +18,7 @@ mod snap;
 mod toast;
 mod toolbar;
 mod translate;
+mod tray;
 mod ui;
 
 fn main() {

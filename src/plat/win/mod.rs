@@ -11,12 +11,10 @@ mod screen;
 mod store;
 mod window;
 
-pub use app::{add_tray, hotkey_ok, notify, post, quit, run, set_hotkey, set_tray_tip, tray_menu};
+pub use app::{add_tray, hotkey_ok, notify, post, quit, run, set_hotkey, set_tray_tip};
 pub(crate) use app::{app_icon, main_window};
 pub use bitmap::Bitmap;
 pub use gfx::{Affine, Canvas, Color, Face, Path, PathBuilder, RectF, Stroke, Text, warm_up};
-#[cfg(test)]
-pub(crate) use gfx::d2d;
 pub(crate) use menu::{menu_draw, menu_measure, popup_menu};
 #[cfg(test)]
 pub use menu::answer_menu;

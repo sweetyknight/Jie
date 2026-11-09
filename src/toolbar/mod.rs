@@ -1,11 +1,13 @@
 //! 操作栏：截图遮罩、钉图编辑、录屏结果共用。布局、绘制、命中；尺寸按设计稿（DIP），换算成物理像素后取整，按钮底色才清楚。
+//! 按钮只放图标，名字和快捷键靠悬停提示（`tip`）；主按钮比普通按钮宽，紫底。
 //! 也管标注工具按钮和标注工具的对应关系。只依赖 plat、ui、annotate，用它的模块之间互不依赖。
 
 pub(crate) mod opts;
 
-use crate::annotate::Tool;
+use crate::annotate::{Kind, Tool};
 use crate::plat::{Canvas, Point as POINT, Rect as RECT, Text};
 use crate::ui::{self, rectf, rgb};
+use opts::Opts;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Act {
@@ -20,17 +22,22 @@ pub enum Act {
     Redo,
     Pin,
     Record,
-    /// 录屏选区上的「延时开始」：点一下换一档（不延时、3、5、10 秒）
-    Delay,
+    /// 录屏选区上延时那排分段的一档：几秒后开始（0 是不延时）
+    Delay(u8),
     Ocr,
     Translate,
     Save,
     Cancel,
     Copy,
     Done,
+    /// 钉图悬停条：编辑标注、关闭、动图暂停和播放
+    Edit,
+    Close,
+    Pause,
+    Play,
 }
 
-/// 一组按钮：(动作, 图标, 提示, 快捷键)；最后一个是主按钮，文字由调用方给
+/// 一组按钮：(动作, 图标, 提示, 快捷键)；最后一个是主按钮（关闭除外）。图标为空的是写字的分段（一组只有一排），字就是提示
 pub type Items = [(Act, &'static str, &'static str, &'static str)];
 
 /// 截图遮罩
@@ -51,9 +58,15 @@ pub const SHOT: [(Act, &str, &str, &str); 15] = [
     (Act::Cancel, "cancel", "取消", "Esc"),
     (Act::Copy, "copy", "复制", "Enter"),
 ];
-/// 录屏快捷键打开的选区：只能框选，主按钮是开始录制，旁边选要不要延时
-pub const RECORD: [(Act, &str, &str, &str); 3] =
-    [(Act::Cancel, "cancel", "取消", "Esc"), (Act::Delay, "timer", "延时开始", ""), (Act::Record, "record", "开始录制", "Enter")];
+/// 录屏模式的选区：前面一排延时分段，主按钮是开始录制
+pub const RECORD: [(Act, &str, &str, &str); 6] = [
+    (Act::Delay(0), "", "不延时", ""),
+    (Act::Delay(3), "", "3 秒", ""),
+    (Act::Delay(5), "", "5 秒", ""),
+    (Act::Delay(10), "", "10 秒", ""),
+    (Act::Cancel, "cancel", "取消", "Esc"),
+    (Act::Record, "record", "开始录制", "Enter"),
+];
 /// 钉图编辑：改动即时生效，没有钉图和取消；复制是普通按钮，主按钮是完成
 pub const PIN: [(Act, &str, &str, &str); 14] = [
     (Act::Rect, "rect", "矩形", "R"),
@@ -74,8 +87,39 @@ pub const PIN: [(Act, &str, &str, &str); 14] = [
 /// 录屏结果（原位播放的动图下面）：主按钮是复制，和截图一致
 pub const RESULT: [(Act, &str, &str, &str); 4] =
     [(Act::Pin, "pin", "钉在屏幕上", ""), (Act::Save, "save", "保存", "Ctrl+S"), (Act::Cancel, "trash", "丢弃", "Esc"), (Act::Copy, "copy", "复制", "Enter")];
-/// 这些按钮后面画分组线
-const SEP_AFTER: [Act; 3] = [Act::Mosaic, Act::Redo, Act::Translate];
+/// 钉图悬停条（鼠标停在钉图上时下面那条）：没有主按钮
+pub const HOVER: [(Act, &str, &str, &str); 6] = [
+    (Act::Edit, "edit", "编辑标注", ""),
+    (Act::Ocr, "ocr", "取字", ""),
+    (Act::Translate, "translate", "翻译", ""),
+    (Act::Copy, "copy", "复制", "Ctrl+C"),
+    (Act::Save, "save", "保存", "Ctrl+S"),
+    (Act::Close, "close", "关闭", "Esc"),
+];
+/// 动图钉图的悬停条，播放中和暂停时两套：取字、翻译认当前这一帧，复制、保存的是 GIF 文件
+pub const HOVER_GIF: [(Act, &str, &str, &str); 6] = [
+    (Act::Pause, "pause", "暂停", ""),
+    (Act::Ocr, "ocr", "取字（当前帧）", ""),
+    (Act::Translate, "translate", "翻译（当前帧）", ""),
+    (Act::Copy, "copy", "复制 GIF", "Ctrl+C"),
+    (Act::Save, "save", "保存 GIF", "Ctrl+S"),
+    (Act::Close, "close", "关闭", "Esc"),
+];
+pub const HOVER_GIF_PAUSED: [(Act, &str, &str, &str); 6] = [
+    (Act::Play, "play", "播放", ""),
+    HOVER_GIF[1],
+    HOVER_GIF[2],
+    HOVER_GIF[3],
+    HOVER_GIF[4],
+    HOVER_GIF[5],
+];
+/// 这些按钮后面画分组线；「关闭」前面也画
+const SEP_AFTER: [Act; 7] = [Act::Mosaic, Act::Redo, Act::Translate, Act::Delay(10), Act::Edit, Act::Pause, Act::Play];
+
+/// 主按钮：最后一个，关闭不算
+fn main_of(all: &Items) -> Option<Act> {
+    all.last().map(|i| i.0).filter(|a| *a != Act::Close)
+}
 
 /// 操作栏上的标注工具按钮
 const TOOL_ACTS: [(Act, Tool); 7] = [
@@ -96,10 +140,13 @@ pub fn act_of(t: Tool) -> Act {
     TOOL_ACTS.iter().find(|(_, x)| *x == t).map_or(Act::Rect, |(a, _)| *a)
 }
 
-const TEXT: u32 = 0x1A1A1A;
-const TEXT_DISABLED: u32 = 0xA8A8A8;
-const ACCENT: u32 = 0x9C44EC;
-const ACCENT_SOFT: u32 = 0xF3E9FD;
+// 尺寸（DIP）：描边 2 + 内边距 5，按钮 34，间距 3；分组线 2 × 22、左右各 5；主按钮 44 宽、前面多空 2；实心阴影 4
+const INSET: f32 = 7.0;
+const BTN: f32 = 34.0;
+const GAP: f32 = 3.0;
+const SEP_M: f32 = 5.0;
+const MAIN_W: f32 = 44.0;
+const SHADOW: f32 = 4.0;
 
 pub struct Bar {
     pub rect: RECT,
@@ -109,55 +156,84 @@ pub struct Bar {
     buttons: Vec<(Act, RECT)>,
     seps: Vec<i32>,
     scale: f32,
-    /// 按钮右下角的小角标（比如延时的秒数）；有角标的按钮画成选中的样子
-    pub badge: Option<(Act, String)>,
+    /// 最左边的一段说明（录屏结果的「00:12 · 1.3 MB」）和它的 x
+    info: Option<(Text, i32)>,
 }
 
 impl Bar {
     /// 右边和 anchor（选区）右边对齐；先放下方 8 处，放不下放上方，都不行放进里面的右下角；
-    /// 左右推回屏内，离边至少 4。`label_w` 是主按钮文字宽度（像素），`opt_h` 是工具选项条连同间距 4 的高度（没有时 0），
-    /// `all`：用哪组按钮（SHOT、RECORD、PIN、RESULT）。
-    pub fn layout(anchor: RECT, screen_w: i32, screen_h: i32, scale: f32, label_w: f32, opt_h: i32, all: &'static Items) -> Bar {
+    /// 左右推回屏内，离边至少 4。`opt_h` 是工具选项条连同间距的高度（没有时 0），
+    /// `all`：用哪组按钮（SHOT、RECORD、PIN、RESULT）；`info`：按钮前面的一段说明，后面跟分组线（紧跟分段时不加）。`rect` 连右下的实心阴影一起算。
+    pub fn layout(anchor: RECT, screen_w: i32, screen_h: i32, scale: f32, opt_h: i32, all: &'static Items, info: Option<&str>) -> Bar {
         let px = |dip: f32| (dip * scale).round() as i32;
-        // 先按 DIP 从左往右排：外框 1 + 内边距 3，按钮 32，间距 2，分组线左右各再留 4
-        let (mut x, mut items, mut seps) = (4.0, Vec::new(), Vec::new());
-        for (i, (a, ..)) in all.iter().enumerate() {
-            let w = if i + 1 == all.len() {
-                x += 2.0; // 主按钮多留 2
-                8.0 + 20.0 + 4.0 + label_w / scale + 12.0
-            } else {
-                32.0
+        // 先按 DIP 从左往右排
+        let (mut x, mut items, mut seps) = (INSET, Vec::new(), Vec::new());
+        let seg = |i: usize| all.get(i).is_some_and(|it| it.1.is_empty());
+        let info = info.and_then(|t| Text::tabular(crate::plat::Face::Ui, 12.5 * scale, true, t)).map(|t| {
+            let at = INSET + 5.0;
+            x = at + t.width() / scale + 8.0;
+            if !seg(0) {
+                seps.push(x);
+                x += 2.0 + SEP_M;
+            }
+            (t, at)
+        });
+        for (i, (a, _, label, _)) in all.iter().enumerate() {
+            let main = Some(*a) == main_of(all);
+            if main {
+                x += 2.0;
+            }
+            // 分段：外框内边距 3，段间距 2，宽是字 + 左右各 12
+            if seg(i) && (i == 0 || !seg(i - 1)) {
+                x += 3.0;
+            }
+            let w = match () {
+                _ if main => MAIN_W,
+                _ if seg(i) => (Text::new(crate::plat::Face::Ui, 12.5 * scale, true, label).map_or(0.0, |t| t.width()) / scale + 24.0).ceil(),
+                _ => BTN,
             };
             items.push((*a, x, w));
             x += w;
-            if i + 1 < all.len() {
-                x += 2.0;
+            if seg(i) && !seg(i + 1) {
+                x += 3.0;
             }
-            if SEP_AFTER.contains(a) {
-                seps.push(x + 4.0);
-                x += 4.0 + 1.0 + 4.0 + 2.0;
+            if i + 1 < all.len() {
+                x += if seg(i) && seg(i + 1) { 2.0 } else { GAP };
+            }
+            if SEP_AFTER.contains(a) || all.get(i + 1).is_some_and(|n| n.0 == Act::Close) {
+                // 按钮后面已经空了 GAP，分组线离两边按钮各 SEP_M
+                seps.push(x + SEP_M - GAP);
+                x += SEP_M - GAP + 2.0 + SEP_M;
             }
         }
-        let (bw, bh) = (px(x + 4.0), px(40.0));
+        // 本体宽高，外面再加阴影
+        let (bw, bh, d) = (px(x + INSET), px(INSET + BTN + INSET), px(SHADOW));
         let (m, g) = (px(4.0), px(8.0));
-        let left = (anchor.right - bw).min(screen_w - bw - m).max(m);
-        let (top, below) = if anchor.bottom + g + bh + opt_h <= screen_h - m {
+        let left = (anchor.right - bw).min(screen_w - bw - d - m).max(m);
+        let (top, below) = if anchor.bottom + g + bh + d + opt_h <= screen_h - m {
             (anchor.bottom + g, true)
-        } else if anchor.top - g - bh - opt_h >= m {
-            (anchor.top - g - bh, false)
+        } else if anchor.top - g - bh - d - opt_h >= m {
+            (anchor.top - g - bh - d, false)
         } else {
-            ((anchor.bottom - g - bh).min(screen_h - m - bh).max(m + opt_h), false)
+            ((anchor.bottom - g - bh - d).min(screen_h - m - bh - d).max(m + opt_h), false)
         };
-        let (bt, bb) = (top + px(4.0), top + px(36.0));
-        let buttons = items.iter().map(|(a, x, w)| (*a, RECT { left: left + px(*x), top: bt, right: left + px(x + w), bottom: bb })).collect();
+        let (bt, bb) = (top + px(INSET), top + px(INSET + BTN));
+        let buttons = items
+            .iter()
+            .enumerate()
+            .map(|(i, (a, x, w))| {
+                let inset = if seg(i) { px(3.0) } else { 0 };
+                (*a, RECT { left: left + px(*x), top: bt + inset, right: left + px(x + w), bottom: bb - inset })
+            })
+            .collect();
         Bar {
-            rect: RECT { left, top, right: left + bw, bottom: top + bh },
+            rect: RECT { left, top, right: left + bw + d, bottom: top + bh + d },
             below,
             items: all,
             buttons,
             seps: seps.iter().map(|x| left + px(*x)).collect(),
             scale,
-            badge: None,
+            info: info.map(|(t, at)| (t, left + px(at))),
         }
     }
 
@@ -172,61 +248,83 @@ impl Bar {
         (t, k)
     }
 
+    /// 按钮的图标；写字的分段是空的
+    pub fn icon(&self, a: Act) -> &'static str {
+        self.items.iter().find(|i| i.0 == a).unwrap().1
+    }
+
     pub fn button(&self, a: Act) -> RECT {
         self.buttons.iter().find(|(b, _)| *b == a).map(|(_, r)| *r).unwrap_or(self.rect)
     }
 
-    /// `hot`：鼠标下的按钮；`down`：按住的按钮；`on`：当前工具；`enabled`：不能用的按钮置灰
-    pub fn draw(&self, c: &Canvas, label: &Text, hot: Option<Act>, down: Option<Act>, on: Option<Act>, enabled: impl Fn(Act) -> bool) {
-        let (s, on_tool, main) = (self.scale, on, self.items[self.items.len() - 1].0);
-        let f = |r: &RECT| (r.left as f32, r.top as f32, r.right as f32, r.bottom as f32);
-        // 1 像素以上的整像素描边画在像素中心，外框才不糊
-        let lw = s.round().max(1.0);
-        let (l, t, r, b) = f(&self.rect);
-        let h = lw / 2.0;
-        let frame = rectf(l + h, t + h, r - h, b - h);
-        c.fill_round(frame, 8.0 * s, rgb(0xFAFAFA));
-        c.stroke_round(frame, 8.0 * s, rgb(0xD4D4D4), lw);
+    /// `hot`：鼠标下的按钮；`down`：按住的按钮；`on`：当前工具（或选中的那段）；`enabled`：不能用的按钮置灰
+    pub fn draw(&self, c: &Canvas, hot: Option<Act>, down: Option<Act>, on: Option<Act>, enabled: impl Fn(Act) -> bool) {
+        let (s, main) = (self.scale, main_of(self.items));
+        let f = |r: &RECT| rectf(r.left as f32, r.top as f32, r.right as f32, r.bottom as f32);
+        let d = (SHADOW * s).round();
+        let body = f(&self.rect);
+        let body = rectf(body.left, body.top, body.right - d, body.bottom - d);
+        ui::block(c, body, 10.0, SHADOW, ui::SURF, s);
+        let lw = ui::line_w(s);
+        let mid = (body.top + body.bottom) / 2.0;
         for x in &self.seps {
-            let mid = (t + b) / 2.0;
-            c.fill_rect(rectf(*x as f32, mid - 10.0 * s, *x as f32 + lw, mid + 10.0 * s), rgb(0xD4D4D4));
+            c.fill_rect(rectf(*x as f32, mid - 11.0 * s, *x as f32 + lw, mid + 11.0 * s), rgb(ui::INK));
+        }
+        if let Some((t, x)) = &self.info {
+            c.text(t, *x as f32, mid - t.height() / 2.0, rgb(ui::INK));
+        }
+        // 分段的外框：白底墨色描边，圈住那一排
+        let segs: Vec<RECT> = self.buttons.iter().filter(|(a, _)| self.icon(*a).is_empty()).map(|(_, r)| *r).collect();
+        if let (Some(a), Some(b)) = (segs.first(), segs.last()) {
+            let p = (3.0 * s).round();
+            ui::block(c, rectf(a.left as f32 - p, a.top as f32 - p, b.right as f32 + p, b.bottom as f32 + p), 7.0, 0.0, ui::SURF, s);
         }
         for (a, r) in &self.buttons {
-            let (l, t, rr, bb) = f(r);
-            let on = enabled(*a);
-            let state = |normal: u32, hover: u32, press: u32| match (on && hot == Some(*a), down == Some(*a)) {
-                (true, true) => Some(press),
-                (true, false) => Some(hover),
-                _ => (normal != 0).then_some(normal),
-            };
-            let icon_name = self.items.iter().find(|i| i.0 == *a).unwrap().1;
-            let icon_y = t + (bb - t - 20.0 * s) / 2.0;
-            if *a == main {
-                let bg = state(ACCENT, 0xA95CF0, 0x8733D4).unwrap();
-                c.fill_round(rectf(l, t, rr, bb), 4.0 * s, rgb(if on { bg } else { TEXT_DISABLED }));
-                ui::icon(c, icon_name, l + 8.0 * s, icon_y, 20.0 * s, rgb(0xFFFFFF));
-                c.text(label, l + 32.0 * s, t + (bb - t - label.height()) / 2.0, rgb(0xFFFFFF));
-            } else {
-                // 当前工具、带角标的：主题浅底、主题色图标，悬停也不变
-                let current = on_tool == Some(*a) || self.badge.as_ref().is_some_and(|b| b.0 == *a);
-                let bg = if current { Some(ACCENT_SOFT) } else { state(0, 0xEBEBEB, 0xE0E0E0) };
-                if let Some(bg) = bg {
-                    c.fill_round(rectf(l, t, rr, bb), 4.0 * s, rgb(bg));
+            let r = f(r);
+            let icon_name = self.icon(*a);
+            if icon_name.is_empty() {
+                // 一段：选中的墨底白字，悬停浅紫
+                let fg = if on == Some(*a) {
+                    c.fill_round(r, 5.0 * s, rgb(ui::INK));
+                    0xFFFFFF
+                } else if hot == Some(*a) {
+                    c.fill_round(r, 5.0 * s, rgb(if down == Some(*a) { ui::PRESS } else { ui::HOVER }));
+                    ui::INK
+                } else {
+                    ui::MUTED
+                };
+                if let Some(l) = Text::new(crate::plat::Face::Ui, 12.5 * s, true, self.tip(*a).0) {
+                    c.text(&l, (r.left + r.right - l.width()) / 2.0, (r.top + r.bottom - l.height()) / 2.0, rgb(fg));
                 }
-                let x = l + (rr - l - 20.0 * s) / 2.0;
-                let fg = if current { ACCENT } else if on { TEXT } else { TEXT_DISABLED };
-                ui::icon(c, icon_name, x, icon_y, 20.0 * s, rgb(fg));
+                continue;
             }
-        }
-        // 角标：主题色圆角底、白色小字，贴着按钮右下角
-        if let Some((a, t)) = &self.badge
-            && let Some(l) = Text::tabular(crate::plat::Face::Ui, 9.0 * s, true, t)
-        {
-            let r = self.button(*a);
-            let (w, h) = ((l.width() + 6.0 * s).max(13.0 * s), 13.0 * s);
-            let (x, y) = (r.right as f32 - w + 1.0 * s, r.bottom as f32 - h + 1.0 * s);
-            c.fill_round(rectf(x, y, x + w, y + h), h / 2.0, rgb(ACCENT));
-            c.text(&l, x + (w - l.width()) / 2.0, y + (h - l.height()) / 2.0, rgb(0xFFFFFF));
+            let st = ui::state(enabled(*a), on == Some(*a) && Some(*a) != main, hot == Some(*a), down == Some(*a));
+            let (face, dy, fg) = if Some(*a) == main {
+                (ui::primary(c, r, st, s), 0.0, rgb(0xFFFFFF))
+            } else {
+                let (dy, fg) = ui::button_bg(c, r, st, s);
+                (r, dy, fg)
+            };
+            let x = face.left + (face.right - face.left - 20.0 * s) / 2.0;
+            let y = face.top + (face.bottom - face.top - 20.0 * s) / 2.0 + dy;
+            ui::icon(c, icon_name, x, y, 20.0 * s, fg);
         }
     }
+
+    /// 工具选项条：跟着当前工具，第一个按钮对准工具按钮，小尖角指着它；没有当前工具（选中了已画的标注）就和操作栏左对齐、不画尖角。
+    /// 放在操作栏远离 anchor 的那一侧（操作栏在 anchor 里面时放它上方）。屏幕宽 `screen_w`，左右离边至少 4
+    pub fn opts(&self, kind: Kind, trash: bool, tool: Option<Tool>, screen_w: i32) -> Opts {
+        let s = self.scale;
+        let px = |dip: f32| (dip * s).round() as i32;
+        let (ow, oh) = Opts::size(kind, trash, s);
+        let at = tool.map(|t| self.button(act_of(t)));
+        let x = at.map_or(self.rect.left, |r| r.left - px(INSET)).min(screen_w - ow - px(4.0)).max(px(4.0));
+        let y = if self.below { self.rect.bottom + px(2.0) } else { self.rect.top - px(2.0) - oh };
+        Opts::layout(kind, trash, x, y, s, self.below, at.map(|r| (r.left + r.right) / 2))
+    }
+}
+
+/// 工具选项条连同和操作栏之间的间距有多高：给 `Bar::layout` 的 `opt_h`
+pub fn opts_height(kind: Kind, trash: bool, scale: f32) -> i32 {
+    Opts::size(kind, trash, scale).1 + (2.0 * scale).round() as i32
 }

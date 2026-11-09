@@ -185,31 +185,44 @@ pub fn pick_target(text: &str, target: Lang) -> Lang {
     }
 }
 
-/// 粗判原文语言：汉字和假名每个算一份，ASCII 字母单词每个词算一份。
-/// 中日文占一半及以上算中文（出现假名算日文），否则有单词就算英文，都没有返回 None。
-/// shortcut: 法文、德文等拉丁字母语言也当英文，韩文返回 None；以后加目标语言时再细分。
+/// 英文常见虚词
+const EN_WORDS: &[&str] = &[
+    "the", "and", "is", "are", "was", "were", "of", "to", "in", "on", "at", "for", "with", "from", "by", "this", "that", "it", "you", "we", "they", "be",
+    "have", "has", "not", "or", "will", "can", "an", "as", "if", "but", "your", "my", "i",
+];
+/// 法、德、西、意、葡、荷文的常见虚词（英文里不当词用的）
+const OTHER_WORDS: &[&str] = &[
+    "le", "la", "les", "des", "du", "un", "une", "est", "et", "sont", "pas", "pour", "dans", "sur", "avec", "ce", "cette", "je", "vous", "nous", "qui", "que",
+    "au", "aux", "mais", "ou", "de", "en", "der", "das", "und", "ist", "nicht", "ein", "eine", "ich", "mit", "auf", "zu", "dem", "den", "auch", "von", "sich",
+    "wir", "sind", "es", "el", "los", "las", "y", "una", "por", "con", "para", "del", "como", "pero", "muy", "se", "lo", "il", "di", "che", "della", "gli",
+    "sono", "os", "em", "uma", "com", "het", "een", "van", "niet", "zijn", "met",
+];
+
+/// 粗判原文语言：汉字和假名每个算一份，单词每个算一份。中日文占一半及以上算中文（出现假名算日文）；
+/// 否则看单词：英文虚词不比别的语言的线索（上面那些虚词、带非 ASCII 字母的词，比如重音字母、韩文、俄文）少就算英文。
+/// 别的语言和没有字都返回 None：Jie 只译成中英日，认不出的照设好的目标语言译，卡片上不写原文是哪种语言。
 pub fn detect(text: &str) -> Option<Lang> {
-    let (mut han, mut kana, mut words) = (0, 0, 0);
-    let mut in_word = false;
-    for c in text.chars() {
-        let letter = c.is_ascii_alphabetic();
-        if letter && !in_word {
-            words += 1;
-        }
-        in_word = letter;
-        match c {
-            '\u{3041}'..='\u{3096}' | '\u{30A1}'..='\u{30FA}' => kana += 1,
-            '\u{3400}'..='\u{4DBF}' | '\u{4E00}'..='\u{9FFF}' | '\u{F900}'..='\u{FAFF}' => han += 1,
-            _ => {}
+    let cjk = |c: char| {
+        matches!(c, '\u{3041}'..='\u{3096}' | '\u{30A1}'..='\u{30FA}' | '\u{3400}'..='\u{4DBF}' | '\u{4E00}'..='\u{9FFF}' | '\u{F900}'..='\u{FAFF}')
+    };
+    let kana = text.chars().filter(|c| matches!(c, '\u{3041}'..='\u{3096}' | '\u{30A1}'..='\u{30FA}')).count();
+    let han = text.chars().filter(|&c| cjk(c)).count() - kana;
+    let (mut words, mut en, mut other) = (0, 0, 0);
+    for w in text.split(|c: char| !c.is_alphabetic() || cjk(c)).filter(|w| !w.is_empty()) {
+        words += 1;
+        let w = w.to_lowercase();
+        if !w.is_ascii() || OTHER_WORDS.contains(&w.as_str()) {
+            other += 1;
+        } else if EN_WORDS.contains(&w.as_str()) {
+            en += 1;
         }
     }
-    let cjk = han + kana;
-    if cjk + words == 0 {
+    if han + kana + words == 0 {
         None
-    } else if cjk >= words {
+    } else if han + kana >= words {
         Some(if kana > 0 { Lang::Ja } else { Lang::Zh })
     } else {
-        Some(Lang::En)
+        (en >= other).then_some(Lang::En)
     }
 }
 
@@ -344,18 +357,20 @@ pub(crate) mod tests {
         )
     }
 
-    /// 本地 mock：接一个连接、读完请求后回 `reply`；None 表示一直不回应，直到客户端断开。
-    /// 返回服务地址（带 /v1）和收到的请求原文。
+    /// 本地 mock：每个连接读完请求后都回 `reply`；None 表示接一个连接后一直不回应，直到客户端断开。
+    /// 返回服务地址（带 /v1）和收到的请求原文，按到达顺序。
     pub(crate) fn mock(reply: Option<String>) -> (String, mpsc::Receiver<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}/v1", listener.local_addr().unwrap());
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
-            let (mut s, _) = listener.accept().unwrap();
-            tx.send(read_request(&mut s)).unwrap();
-            match reply {
-                Some(r) => s.write_all(r.as_bytes()).unwrap(),
-                None => drop(s.read(&mut [0u8; 1])),
+            for s in listener.incoming() {
+                let mut s = s.unwrap();
+                let _ = tx.send(read_request(&mut s));
+                match &reply {
+                    Some(r) => s.write_all(r.as_bytes()).unwrap(),
+                    None => return drop(s.read(&mut [0u8; 1])),
+                }
             }
         });
         (base, rx)
@@ -577,6 +592,15 @@ pub(crate) mod tests {
         assert_eq!(detect("今日はいい天気ですね"), Some(Lang::Ja));
         assert_eq!(detect("12345 !!"), None);
         assert_eq!(detect("안녕하세요"), None);
+        // 界面上没有虚词的英文、英文里夹一个重音词，还是英文
+        assert_eq!(detect("File Edit Selection View Go Run Terminal Help"), Some(Lang::En));
+        assert_eq!(detect("I went to the café"), Some(Lang::En));
+        // 法、德、西文（不带重音也认得出）、夹英文的韩文俄文：不是英文
+        assert_eq!(detect("Le chat est sur la table"), None);
+        assert_eq!(detect("Der Hund ist nicht im Haus"), None);
+        assert_eq!(detect("El perro está en la casa"), None);
+        assert_eq!(detect("안녕하세요 Jie 입니다"), None);
+        assert_eq!(detect("Привет мир Jie"), None);
 
         assert_eq!(pick_target("Hello", Lang::Zh), Lang::Zh);
         assert_eq!(pick_target("你好", Lang::Zh), Lang::En);
@@ -584,5 +608,7 @@ pub(crate) mod tests {
         assert_eq!(pick_target("你好", Lang::En), Lang::En);
         assert_eq!(pick_target("こんにちは", Lang::Ja), Lang::En);
         assert_eq!(pick_target("12345", Lang::Zh), Lang::Zh);
+        // 法文译成英文，不再被当成英文改译中文
+        assert_eq!(pick_target("Le chat est sur la table", Lang::En), Lang::En);
     }
 }

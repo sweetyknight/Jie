@@ -11,19 +11,66 @@ pub enum Outcome {
     Failed(String),
 }
 
+/// 服务会把大图缩到约这么多像素（DeepSeek 约 1300×1300），整屏小字缩完就认不清
+const MAX_PX: i32 = 1300 * 1300;
+
 /// 选区编成 PNG 发给 `cfg` 的服务，阻塞，要在工作线程里调。换行交给模型。
-/// shortcut: 大图由服务自己缩小（DeepSeek 缩到约 1300×1300 像素），整屏小字可能认不清；真遇到了再切块分几次发。
+/// 超过 `MAX_PX` 的大图横着切成几条整宽的，同时发出去，结果按从上到下拼起来。
 pub fn recognize(img: &Image, cfg: &translate::Config) -> Outcome {
     let t0 = Instant::now();
-    let png = match plat::encode(img, false) {
-        Ok(p) => base64(&p),
-        Err(e) => return Outcome::Failed(e),
-    };
-    match translate::read_image(cfg, &png, translate::OCR_TIMEOUT) {
-        Ok(text) if text.is_empty() => Outcome::Empty,
-        Ok(text) => Outcome::Text { lines: text.lines().count(), took: format!("{:.1} 秒", t0.elapsed().as_secs_f32()), text },
-        Err(e) => Outcome::Failed(e.to_string()),
+    // 编码在本线程按顺序做（WIC 每次进出临时 MTA），只有请求并发
+    let mut pngs = Vec::new();
+    for (y0, y1) in strips(img) {
+        match plat::encode(&rows(img, y0, y1), false) {
+            Ok(p) => pngs.push(base64(&p)),
+            Err(e) => return Outcome::Failed(e),
+        }
     }
+    let parts: Vec<_> = std::thread::scope(|sc| {
+        let hs: Vec<_> = pngs.iter().map(|png| sc.spawn(move || translate::read_image(cfg, png, translate::OCR_TIMEOUT))).collect();
+        hs.into_iter().map(|h| h.join().expect("识别请求线程")).collect()
+    });
+    let mut text = String::new();
+    for p in parts {
+        match p {
+            Ok(t) if t.is_empty() => {}
+            Ok(t) => {
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str(&t);
+            }
+            Err(e) => return Outcome::Failed(e.to_string()),
+        }
+    }
+    if text.is_empty() {
+        Outcome::Empty
+    } else {
+        Outcome::Text { lines: text.lines().count(), took: format!("{:.1} 秒", t0.elapsed().as_secs_f32()), text }
+    }
+}
+
+/// 横着切成几条整宽的：每条不超过 `MAX_PX` 像素；切口在每条下沿往上 1/4 条高以内，挑和行首像素不一样的最少的那一行，尽量切在字行之间
+fn strips(img: &Image) -> Vec<(i32, i32)> {
+    let hmax = (MAX_PX / img.w.max(1)).max(32);
+    let busy = |y: i32| {
+        let row = &img.px[(y * img.w * 4) as usize..][..(img.w * 4) as usize];
+        row.chunks_exact(4).filter(|p| p[..3] != row[..3]).count()
+    };
+    let (mut v, mut y0) = (Vec::new(), 0);
+    while img.h - y0 > hmax {
+        let cut = (y0 + hmax * 3 / 4..=y0 + hmax).min_by_key(|&y| busy(y)).unwrap();
+        v.push((y0, cut));
+        y0 = cut;
+    }
+    v.push((y0, img.h));
+    v
+}
+
+/// 第 [y0, y1) 行拷成一张图
+fn rows(img: &Image, y0: i32, y1: i32) -> Image {
+    let r = (img.w * 4) as usize;
+    Image { w: img.w, h: y1 - y0, px: img.px[y0 as usize * r..y1 as usize * r].to_vec() }
 }
 
 /// 标准 base64，带 = 补齐。不用 WinRT 的 CryptographicBuffer：windows crate 全局缓存它的工厂，
@@ -77,6 +124,28 @@ pub(crate) mod tests {
             }
         }
         100.0 * d[b.len()] as f64 / a.len() as f64
+    }
+
+    /// 4K 整屏：白底上每 30 行有 18 行「字」。切出的条首尾相接、每条不超过 MAX_PX，切口都落在空白行
+    #[test]
+    fn strips_cut_between_lines() {
+        let (w, h) = (3840, 2160);
+        let mut px = vec![255u8; (w * h * 4) as usize];
+        for y in (0..h).filter(|y| y % 30 >= 6 && y % 30 < 24) {
+            for x in (0..w).step_by(7) {
+                px[((y * w + x) * 4) as usize..][..3].fill(0);
+            }
+        }
+        let img = Image { w, h, px };
+        let s = super::strips(&img);
+        assert!(s.len() > 1 && s[0].0 == 0 && s.last().unwrap().1 == h);
+        for (a, b) in s.windows(2).map(|p| (p[0], p[1])) {
+            assert_eq!(a.1, b.0);
+            assert!(a.1 % 30 < 6 || a.1 % 30 >= 24, "切在字上：第 {} 行", a.1);
+        }
+        assert!(s.iter().all(|&(y0, y1)| (y1 - y0) * w <= super::MAX_PX));
+        // 小图不切
+        assert_eq!(super::strips(&Image { w: 800, h: 600, px: vec![255; 800 * 600 * 4] }), vec![(0, 600)]);
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! 设置窗口：标准窗口 + 自绘控件（导航、开关、色块、取色器、分段、下拉、按钮）。
+//! 设置窗口：系统边框 + 自绘内容（新野兽派：奶油底、左边导航、右边白色面板）。
 //! 只有输入框和快捷键框用系统控件，去掉系统边框、边框自己画。「确定」时统一保存并立即生效，
 //! 快捷键注册失败就恢复原键、停在窗口里提示。尺寸按设计稿（DIP）乘窗口所在显示器的缩放比例。
 
@@ -8,48 +8,49 @@ use crate::settings::{self, FPS_CHOICES, Format, Hotkey, Settings};
 use crate::toast::{self, Kind};
 use crate::translate::{self, Lang};
 use crate::ui::{self, rectf, rgb, rgba};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 const T_SPIN: usize = 1;
 const FRAME_MS: u32 = 16;
 
 // 设计稿尺寸（DIP）
 const WIN_W: f32 = 640.0;
-/// 内容区高度：放得下「截图」页展开取色器的样子
-const MAIN_H: f32 = 428.0;
-const FOOT_H: f32 = 53.0;
-const NAV_W: f32 = 148.0;
+/// 内容区高度：放得下「常规」页展开取色器、「文字与翻译」页打开识别服务的样子
+const MAIN_H: f32 = 486.0;
+const FOOT_H: f32 = 60.0;
+/// 导航宽；右边白色面板从这里到 PANEL_R
+const NAV_W: f32 = 158.0;
+const PANEL_R: f32 = 626.0;
 /// 标签列、控件列的左边，内容区右边
-const LX: f32 = 172.0;
-const CX: f32 = 260.0;
-const RIGHT: f32 = 616.0;
-/// 第一行的顶
-const ROW0: f32 = 58.0;
-/// 色块那一行、取色器方框的顶
-const SW_Y: f32 = 160.0;
-const PICK_Y: f32 = 190.0;
+const LX: f32 = 184.0;
+const CX: f32 = 290.0;
+const RIGHT: f32 = 600.0;
+/// 第一行的顶；输入框、按钮高
+const ROW0: f32 = 66.0;
+const FIELD_H: f32 = 32.0;
+/// 「常规」页：第二个快捷键、开机启动、色块那一行，取色器方框的顶
+const REC_Y: f32 = 110.0;
+const AUTO_Y: f32 = 180.0;
+const SW_Y: f32 = 224.0;
+const PICK_Y: f32 = 264.0;
+/// 「文字与翻译」页：识别服务开关那一行
+const OCR_Y: f32 = 242.0;
 
-const TEXT: u32 = 0x1A1A1A;
-const HINT: u32 = 0x5F5A66;
-const LINE: u32 = 0xCFCCD3;
-const ACCENT: u32 = 0x9C44EC;
-const ACCENT_HOVER: u32 = 0xA95CF0;
-const ACCENT_PRESS: u32 = 0x8733D4;
-const ACCENT_SOFT: u32 = 0xF3E9FD;
-const ERR: u32 = 0xC42B1C;
-const OK: u32 = 0x107C10;
+/// 白底上的出错、成功字（ui::ERR、ui::OK 是填充色，做字太浅）
+const ERR_TEXT: u32 = 0xC42B1C;
+const OK_TEXT: u32 = 0x1D7A3A;
 /// 设置窗口的字一律 Segoe UI（不用界面字的 Variable 版），和系统输入框里的字一样
 const FONT: Face = Face::Segoe;
 
-const PAGES: [&str; 5] = ["截图", "录屏", "保存", "文字识别", "翻译"];
-const SHOT_PAGE: usize = 0;
-const REC_PAGE: usize = 1;
-const SAVE_PAGE: usize = 2;
-const OCR_PAGE: usize = 3;
-const TR_PAGE: usize = 4;
+/// 页名和导航图标
+const PAGES: [(&str, &str); 3] = [("常规", "sliders"), ("截图与录屏", "crop"), ("文字与翻译", "translate")];
+const GENERAL_PAGE: usize = 0;
+const CAPTURE_PAGE: usize = 1;
+const SERVICE_PAGE: usize = 2;
 const PRESETS: [(&str, u32); 7] =
     [("紫", 0x9C44EC), ("品红", 0xE0389A), ("红", 0xE5383B), ("橙", 0xF27A1A), ("黄", 0xF5B700), ("绿", 0x23A55A), ("白", 0xFFFFFF)];
 const TARGETS: [(Lang, &str); 3] = [(Lang::Zh, "简体中文"), (Lang::En, "English"), (Lang::Ja, "日本語")];
+const FORMATS: [&str; 2] = ["PNG", "JPEG"];
 
 /// 自绘控件
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -64,11 +65,13 @@ enum Ctl {
     Format(usize),
     /// 录屏帧率，FPS_CHOICES 里的第几个
     Fps(usize),
-    /// 录屏页的「动图边框」开关
+    /// 「动图边框」开关
     GifFrame,
     Target,
-    /// 模型框右边的「选择…」（翻译页和文字识别页各一个，用的是当前页的框）
-    Models,
+    /// 模型框右边的「选择…」：false 是翻译服务的，true 是识别服务的
+    Models(bool),
+    /// 「另用一家服务识别文字」开关
+    Ocr,
     Test,
     Ok,
     Cancel,
@@ -84,7 +87,7 @@ enum Child {
     Endpoint,
     Model,
     Key,
-    /// 取字的服务，留空就用翻译的
+    /// 识别文字的服务，开关打开才显示；留空的项沿用上面的
     OcrEndpoint,
     OcrModel,
     OcrKey,
@@ -106,11 +109,9 @@ const CHILDREN: [Child; 10] = [
 impl Child {
     fn page(self) -> usize {
         match self {
-            Child::Hotkey | Child::Hex => SHOT_PAGE,
-            Child::RecHotkey => REC_PAGE,
-            Child::SaveDir => SAVE_PAGE,
-            Child::OcrEndpoint | Child::OcrModel | Child::OcrKey => OCR_PAGE,
-            _ => TR_PAGE,
+            Child::Hotkey | Child::RecHotkey | Child::Hex => GENERAL_PAGE,
+            Child::SaveDir => CAPTURE_PAGE,
+            _ => SERVICE_PAGE,
         }
     }
 }
@@ -153,6 +154,8 @@ struct Ui {
     fps: u32,
     gif_frame: bool,
     target: Lang,
+    /// 另用一家服务识别文字
+    ocr: bool,
     key0: String,
     ocr_key0: String,
     /// 哪个快捷键框有问题、原因
@@ -171,7 +174,7 @@ pub fn show(hotkey: bool) {
     if let Some(&w) = Win::all(plat::Kind::Settings).first() {
         if hotkey {
             w.with(|ui: &mut Ui| {
-                ui.set_page(SHOT_PAGE);
+                ui.set_page(GENERAL_PAGE);
                 w.focus_field(Some(Child::Hotkey as usize));
             });
         }
@@ -201,6 +204,7 @@ pub fn show(hotkey: bool) {
         fps: orig.record_fps,
         gif_frame: orig.gif_frame,
         target: orig.target,
+        ocr: !orig.ocr_endpoint.is_empty() || !orig.ocr_model.is_empty(),
         key0: plat::api_key(settings::TRANSLATE_KEY),
         ocr_key0: plat::api_key(settings::OCR_KEY),
         hk_bad: None,
@@ -227,11 +231,11 @@ pub fn show(hotkey: bool) {
     }
 }
 
-/// 文字卡片的「设置」：打开设置并翻到翻译页，`ocr` 为 true 时翻到文字识别页
-pub fn show_service(ocr: bool) {
+/// 文字卡片的「设置」：打开设置并翻到「文字与翻译」
+pub fn show_service() {
     show(false);
     if let Some(&w) = Win::all(plat::Kind::Settings).first() {
-        w.with(|ui: &mut Ui| ui.set_page(if ocr { OCR_PAGE } else { PAGES.len() - 1 }));
+        w.with(|ui: &mut Ui| ui.set_page(SERVICE_PAGE));
     }
 }
 
@@ -302,9 +306,9 @@ impl Ui {
         Text::new(FONT, size * self.scale, bold, text).map_or(0.0, |l| l.width()) / self.scale
     }
 
-    /// 普通按钮宽：文字 + 左右各 12，至少 72
-    fn btn_w(&self, text: &str, bold: bool) -> f32 {
-        (self.tw(text, 12.0, bold) + 24.0).max(72.0).ceil()
+    /// 带字按钮宽：文字 + 左右各 14，至少 72
+    fn btn_w(&self, text: &str) -> f32 {
+        (self.tw(text, 13.0, true) + 28.0).max(72.0).ceil()
     }
 
     fn swatch(&self) -> usize {
@@ -320,40 +324,51 @@ impl Ui {
     }
 
     fn drop_w(&self, text: &str) -> f32 {
-        // 左 10 + 文字 + 间距 12 + 箭头 14 + 右 6，至少 200
-        (self.tw(text, 12.0, false) + 42.0).clamp(200.0, RIGHT - CX).ceil()
+        // 左 10 + 文字 + 间距 8 + 箭头 16 + 右 8，至少 120
+        (self.tw(text, 13.0, false) + 42.0).clamp(120.0, RIGHT - CX).ceil()
     }
 
     fn target_hint(&self) -> &'static str {
         if self.target == Lang::En { "原文已是英文时改译成中文" } else { "原文已是这种语言时改译成英文" }
     }
 
-    /// 「译成」后面的提示在下拉框右边放不下，就折到下一行（设计稿的 flex-wrap）
-    fn hint_wraps(&self) -> bool {
-        CX + self.drop_w(self.target_label()) + 8.0 + self.tw(self.target_hint(), 12.0, false) > RIGHT
-    }
-
-    /// 分段按钮里一段的宽：文字 + 左右各 16
-    fn seg_w(&self, t: &str) -> f32 {
-        (self.tw(t, 12.0, true) + 32.0).ceil()
-    }
-
     fn fps_index(&self) -> usize {
         FPS_CHOICES.iter().position(|f| *f == self.fps).unwrap_or(1)
     }
 
+    /// 一行分段（顶 `y`）里各段的位置：外框内边距 3、段间距 2，每段文字 + 左右各 12
+    fn segs<T: AsRef<str>>(&self, y: f32, labels: &[T]) -> Vec<Rect> {
+        let mut x = CX + 3.0;
+        labels
+            .iter()
+            .map(|l| {
+                let w = (self.tw(l.as_ref(), 12.5, true) + 24.0).ceil();
+                x += w + 2.0;
+                self.rect(x - w - 2.0, y + 3.0, x - 2.0, y + FIELD_H - 3.0)
+            })
+            .collect()
+    }
+
+    /// 开关 44 × 24，在一行（顶 `y`）里上下居中
+    fn switch_rect(&self, y: f32) -> Rect {
+        self.rect(CX, y + 4.0, CX + 44.0, y + 28.0)
+    }
+
     /// 输入框的外框（DIP）
     fn field_dip(&self, c: Child) -> (f32, f32, f32, f32) {
+        let row = |y: f32| (CX, y, RIGHT, y + FIELD_H);
+        let with_btn = |y: f32, b: &str| (CX, y, RIGHT - 10.0 - self.btn_w(b), y + FIELD_H);
         match c {
-            Child::Hotkey | Child::RecHotkey => (CX, ROW0, RIGHT, ROW0 + 28.0),
-            Child::SaveDir => (CX, ROW0, RIGHT - 8.0 - self.btn_w("浏览…", false), ROW0 + 28.0),
+            Child::Hotkey => row(ROW0),
+            Child::RecHotkey => row(REC_Y),
+            Child::SaveDir => with_btn(ROW0, "浏览…"),
             Child::Hex => (CX + 47.0, PICK_Y + 159.0, CX + 143.0, PICK_Y + 187.0),
-            Child::Endpoint => (CX, 58.0, RIGHT, 86.0),
-            Child::Model => (CX, 98.0, RIGHT - 8.0 - self.btn_w("选择…", false), 126.0),
-            Child::Key => (CX, 138.0, RIGHT, 166.0),
-            Child::OcrEndpoint => (CX, 58.0, RIGHT, 86.0),
-            Child::OcrModel => (CX, 98.0, RIGHT - 8.0 - self.btn_w("选择…", false), 126.0),
-            Child::OcrKey => (CX, 138.0, RIGHT, 166.0),
+            Child::Endpoint => row(ROW0),
+            Child::Model => with_btn(ROW0 + 44.0, "选择…"),
+            Child::Key => row(ROW0 + 88.0),
+            Child::OcrEndpoint => row(OCR_Y + 44.0),
+            Child::OcrModel => with_btn(OCR_Y + 88.0, "选择…"),
+            Child::OcrKey => row(OCR_Y + 132.0),
         }
     }
 
@@ -363,55 +378,58 @@ impl Ui {
     }
 
     fn visible(&self, c: Child) -> bool {
-        c.page() == self.page && (c != Child::Hex || self.picker)
+        c.page() == self.page
+            && match c {
+                Child::Hex => self.picker,
+                Child::OcrEndpoint | Child::OcrModel | Child::OcrKey => self.ocr,
+                _ => true,
+            }
+    }
+
+    /// 测试连接那一行的顶：识别服务的三项打开时往下挪
+    fn test_y(&self) -> f32 {
+        if self.ocr { OCR_Y + 176.0 } else { OCR_Y + 70.0 }
     }
 
     /// 当前页能点的自绘控件和位置
     fn ctls(&self) -> Vec<(Ctl, Rect)> {
         let mut v: Vec<(Ctl, Rect)> =
-            (0..PAGES.len()).map(|i| (Ctl::Nav(i), self.rect(8.0, 12.0 + 36.0 * i as f32, NAV_W - 8.0, 46.0 + 36.0 * i as f32))).collect();
+            (0..PAGES.len()).map(|i| (Ctl::Nav(i), self.rect(10.0, 6.0 + 46.0 * i as f32, NAV_W - 10.0, 46.0 + 46.0 * i as f32))).collect();
+        let btn = |b: &str, y: f32| self.rect(RIGHT - self.btn_w(b), y, RIGHT, y + FIELD_H);
         match self.page {
-            SHOT_PAGE => {
-                v.push((Ctl::Toggle, self.rect(CX, 124.0, CX + 40.0, 144.0)));
+            GENERAL_PAGE => {
+                v.push((Ctl::Toggle, self.switch_rect(AUTO_Y)));
                 for i in 0..8 {
-                    let x = CX + 30.0 * i as f32;
-                    v.push((Ctl::Swatch(i), self.rect(x, SW_Y, x + 24.0, SW_Y + 24.0)));
+                    let x = CX + 36.0 * i as f32;
+                    v.push((Ctl::Swatch(i), self.rect(x, SW_Y, x + 32.0, SW_Y + 32.0)));
                 }
                 if self.picker {
                     v.push((Ctl::Sv, self.rect(CX + 11.0, PICK_Y + 11.0, CX + 211.0, PICK_Y + 131.0)));
                     v.push((Ctl::Hue, self.rect(CX + 11.0, PICK_Y + 139.0, CX + 211.0, PICK_Y + 151.0)));
                 }
             }
-            REC_PAGE => {
-                let fw = self.seg_w("30");
-                for i in 0..FPS_CHOICES.len() {
-                    let x = CX + fw * i as f32;
-                    v.push((Ctl::Fps(i), self.rect(x, 126.0, x + fw, 154.0)));
-                }
-                v.push((Ctl::GifFrame, self.rect(CX, 216.0, CX + 40.0, 236.0)));
-            }
-            SAVE_PAGE => {
-                v.push((Ctl::Browse, self.rect(RIGHT - self.btn_w("浏览…", false), ROW0, RIGHT, ROW0 + 28.0)));
-                let w0 = self.seg_w("PNG");
-                v.push((Ctl::Format(0), self.rect(CX, 126.0, CX + w0, 154.0)));
-                v.push((Ctl::Format(1), self.rect(CX + w0, 126.0, CX + w0 + self.seg_w("JPEG"), 154.0)));
-            }
-            OCR_PAGE => {
-                v.push((Ctl::Models, self.rect(RIGHT - self.btn_w("选择…", false), 98.0, RIGHT, 126.0)));
-                v.push((Ctl::Test, self.rect(CX, 198.0, CX + self.btn_w("测试连接", false), 226.0)));
+            CAPTURE_PAGE => {
+                v.push((Ctl::Browse, btn("浏览…", ROW0)));
+                v.extend(self.segs(136.0, &FORMATS).into_iter().enumerate().map(|(i, r)| (Ctl::Format(i), r)));
+                v.extend(self.segs(180.0, &FPS_CHOICES.map(|f| f.to_string())).into_iter().enumerate().map(|(i, r)| (Ctl::Fps(i), r)));
+                v.push((Ctl::GifFrame, self.switch_rect(268.0)));
             }
             _ => {
-                v.push((Ctl::Models, self.rect(RIGHT - self.btn_w("选择…", false), 98.0, RIGHT, 126.0)));
-                v.push((Ctl::Target, self.rect(CX, 178.0, CX + self.drop_w(self.target_label()), 206.0)));
-                let y = if self.hint_wraps() { 240.0 } else { 218.0 };
-                v.push((Ctl::Test, self.rect(CX, y, CX + self.btn_w("测试连接", false), y + 28.0)));
+                v.push((Ctl::Models(false), btn("选择…", ROW0 + 44.0)));
+                v.push((Ctl::Target, self.rect(CX, ROW0 + 132.0, CX + self.drop_w(self.target_label()), ROW0 + 132.0 + FIELD_H)));
+                v.push((Ctl::Ocr, self.switch_rect(OCR_Y)));
+                if self.ocr {
+                    v.push((Ctl::Models(true), btn("选择…", OCR_Y + 88.0)));
+                }
+                let y = self.test_y();
+                v.push((Ctl::Test, self.rect(CX, y, CX + self.btn_w("测试连接"), y + FIELD_H)));
             }
         }
-        let y = MAIN_H + 13.0;
-        let cw = self.btn_w("取消", false);
-        let ow = self.btn_w("确定", true);
-        v.push((Ctl::Ok, self.rect(WIN_W - 16.0 - cw - 8.0 - ow, y, WIN_W - 16.0 - cw - 8.0, y + 28.0)));
-        v.push((Ctl::Cancel, self.rect(WIN_W - 16.0 - cw, y, WIN_W - 16.0, y + 28.0)));
+        // 底栏按钮右对齐面板：Windows「确定 取消」，mac「取消 确定」
+        let (y, ow, cw) = (MAIN_H + 13.0, self.btn_w("确定"), self.btn_w("取消"));
+        let ((first, fw), (second, sw)) = if cfg!(target_os = "macos") { ((Ctl::Cancel, cw), (Ctl::Ok, ow)) } else { ((Ctl::Ok, ow), (Ctl::Cancel, cw)) };
+        v.push((first, self.rect(PANEL_R - sw - 10.0 - fw, y, PANEL_R - sw - 10.0, y + 34.0)));
+        v.push((second, self.rect(PANEL_R - sw, y, PANEL_R, y + 34.0)));
         v
     }
 
@@ -509,6 +527,12 @@ impl Ui {
         self.w.kill_timer(T_SPIN);
     }
 
+    fn set_ocr(&mut self, on: bool) {
+        self.ocr = on;
+        self.reset_test();
+        self.show_kids();
+    }
+
     fn set_picker(&mut self, on: bool) {
         self.picker = on;
         self.show_kids();
@@ -553,8 +577,9 @@ impl Ui {
             Ctl::Format(i) => self.format = if i == 0 { Format::Png } else { Format::Jpeg },
             Ctl::Fps(i) => self.fps = FPS_CHOICES[i],
             Ctl::GifFrame => self.gif_frame = !self.gif_frame,
+            Ctl::Ocr => self.set_ocr(!self.ocr),
             Ctl::Test => self.start_test(),
-            Ctl::Models => self.start_models(),
+            Ctl::Models(ocr) => self.start_models(ocr),
             Ctl::Browse => self.browse(),
             Ctl::Target => self.menu(c),
             Ctl::Ok => return self.apply(),
@@ -564,35 +589,37 @@ impl Ui {
         self.w.invalidate_all();
     }
 
-    /// Tab 顺序：导航（当前页）、本页的控件、确定、取消；色块、分段、导航各算一站，站里用方向键
+    /// Tab 顺序：导航（当前页）、本页的控件、底栏按钮；色块、分段、导航各算一站，站里用方向键
     fn order(&self) -> Vec<Focus> {
         let mut v = vec![Focus::Ctl(Ctl::Nav(self.page))];
         match self.page {
-            SHOT_PAGE => {
-                v.extend([Focus::Child(Child::Hotkey), Focus::Ctl(Ctl::Toggle), Focus::Ctl(Ctl::Swatch(self.swatch()))]);
+            GENERAL_PAGE => {
+                v.extend([Focus::Child(Child::Hotkey), Focus::Child(Child::RecHotkey), Focus::Ctl(Ctl::Toggle), Focus::Ctl(Ctl::Swatch(self.swatch()))]);
                 if self.picker {
                     v.push(Focus::Child(Child::Hex));
                 }
             }
-            REC_PAGE => v.extend([Focus::Child(Child::RecHotkey), Focus::Ctl(Ctl::Fps(self.fps_index())), Focus::Ctl(Ctl::GifFrame)]),
-            SAVE_PAGE => v.extend([Focus::Ctl(Ctl::Browse), Focus::Ctl(Ctl::Format(self.format_index()))]),
-            OCR_PAGE => v.extend([
-                Focus::Child(Child::OcrEndpoint),
-                Focus::Child(Child::OcrModel),
-                Focus::Ctl(Ctl::Models),
-                Focus::Child(Child::OcrKey),
-                Focus::Ctl(Ctl::Test),
-            ]),
-            _ => v.extend([
-                Focus::Child(Child::Endpoint),
-                Focus::Child(Child::Model),
-                Focus::Ctl(Ctl::Models),
-                Focus::Child(Child::Key),
-                Focus::Ctl(Ctl::Target),
-                Focus::Ctl(Ctl::Test),
-            ]),
+            CAPTURE_PAGE => v.extend([Focus::Ctl(Ctl::Browse), Focus::Ctl(Ctl::Format(self.format_index())), Focus::Ctl(Ctl::Fps(self.fps_index())), Focus::Ctl(Ctl::GifFrame)]),
+            _ => {
+                v.extend([
+                    Focus::Child(Child::Endpoint),
+                    Focus::Child(Child::Model),
+                    Focus::Ctl(Ctl::Models(false)),
+                    Focus::Child(Child::Key),
+                    Focus::Ctl(Ctl::Target),
+                    Focus::Ctl(Ctl::Ocr),
+                ]);
+                if self.ocr {
+                    v.extend([Focus::Child(Child::OcrEndpoint), Focus::Child(Child::OcrModel), Focus::Ctl(Ctl::Models(true)), Focus::Child(Child::OcrKey)]);
+                }
+                v.push(Focus::Ctl(Ctl::Test));
+            }
         }
-        v.extend([Focus::Ctl(Ctl::Ok), Focus::Ctl(Ctl::Cancel)]);
+        if cfg!(target_os = "macos") {
+            v.extend([Focus::Ctl(Ctl::Cancel), Focus::Ctl(Ctl::Ok)]);
+        } else {
+            v.extend([Focus::Ctl(Ctl::Ok), Focus::Ctl(Ctl::Cancel)]);
+        }
         v
     }
 
@@ -620,8 +647,9 @@ impl Ui {
 
     fn tab(&mut self, back: bool) {
         let order = self.order();
+        // 色块、分段、导航里换了哪一个都算同一站
         let same = |a: &Focus, b: &Focus| match (a, b) {
-            (Focus::Ctl(x), Focus::Ctl(y)) => std::mem::discriminant(x) == std::mem::discriminant(y),
+            (Focus::Ctl(x @ (Ctl::Nav(_) | Ctl::Swatch(_) | Ctl::Format(_) | Ctl::Fps(_))), Focus::Ctl(y)) => std::mem::discriminant(x) == std::mem::discriminant(y),
             _ => a == b,
         };
         let n = order.len();
@@ -641,7 +669,7 @@ impl Ui {
             Key::Tab => self.tab(shift),
             Key::Esc => self.w.close(),
             Key::Enter => match f {
-                Some(c @ (Ctl::Browse | Ctl::Test | Ctl::Models | Ctl::Cancel | Ctl::Target)) => self.click(c),
+                Some(c @ (Ctl::Browse | Ctl::Test | Ctl::Models(_) | Ctl::Cancel | Ctl::Target)) => self.click(c),
                 _ => self.apply(),
             },
             Key::Space => {
@@ -684,24 +712,15 @@ impl Ui {
         }
     }
 
-    /// 框里当前填的服务（还没保存）：翻译页是翻译服务，文字识别页是大模型取字实际会用的服务
-    fn service(&self) -> translate::Config {
-        let tr = translate::Config {
-            endpoint: self.text(Child::Endpoint).trim().to_string(),
-            model: self.text(Child::Model).trim().to_string(),
-            api_key: self.text(Child::Key).trim().to_string(),
-            target: self.target,
-        };
-        if self.page != OCR_PAGE {
-            return tr;
-        }
+    /// 框里当前填的服务（还没保存）：`ocr` 为 true 时是识别文字实际会用的服务（开关关着就是翻译的）
+    fn service(&self, ocr: bool) -> translate::Config {
         let f = |c| self.text(c).trim().to_string();
-        tr.overlay(&f(Child::OcrEndpoint), &f(Child::OcrModel), f(Child::OcrKey))
+        let tr = translate::Config { endpoint: f(Child::Endpoint), model: f(Child::Model), api_key: f(Child::Key), target: self.target };
+        if ocr && self.ocr { tr.overlay(&f(Child::OcrEndpoint), &f(Child::OcrModel), f(Child::OcrKey)) } else { tr }
     }
 
-    /// 当前页的模型框
-    fn model_box(&self) -> Child {
-        if self.page == OCR_PAGE { Child::OcrModel } else { Child::Model }
+    fn model_box(&self, ocr: bool) -> Child {
+        if ocr { Child::OcrModel } else { Child::Model }
     }
 
     /// 测试连接那一行开始转圈；返回这次请求的编号，结果回来时编号不对就丢掉
@@ -712,44 +731,46 @@ impl Ui {
         self.test_id
     }
 
+    /// 测翻译服务；识别服务开关打开时再发一张图给识别服务，看模型收不收图片
     fn start_test(&mut self) {
         if matches!(self.test, Test::Busy(_)) {
             return;
         }
-        let cfg = self.service();
-        if cfg.endpoint.is_empty() || cfg.model.is_empty() {
+        let (tr, ocr) = (self.service(false), self.ocr.then(|| self.service(true)));
+        if tr.endpoint.is_empty() || tr.model.is_empty() {
             self.test = Test::Done(false, "请先填写服务地址和模型".into());
             return;
         }
-        let ocr = self.page == OCR_PAGE;
         let (id, w) = (self.busy("正在测试…"), self.w);
         std::thread::spawn(move || {
             let t0 = Instant::now();
-            let result = if ocr { translate::test_image(&cfg, translate::TIMEOUT) } else { translate::test_connection(&cfg, translate::TIMEOUT) };
-            let result = result.map(|_| t0.elapsed());
-            w.post(move |ui: &mut Ui, _| ui.tested(id, result));
+            let result = translate::test_connection(&tr, translate::TIMEOUT).map_err(|e| e.to_string()).and_then(|_| match &ocr {
+                Some(c) => translate::test_image(c, translate::TIMEOUT).map_err(|e| format!("识别服务：{e}")),
+                None => Ok(()),
+            });
+            let msg = result.map(|_| format!("连接正常{}，用时 {:.1} 秒", if ocr.is_some() { "，识别模型能看图" } else { "" }, t0.elapsed().as_secs_f32()));
+            w.post(move |ui: &mut Ui, _| ui.tested(id, msg));
         });
     }
 
-    fn tested(&mut self, id: u32, result: Result<Duration, translate::Error>) {
+    fn tested(&mut self, id: u32, result: Result<String, String>) {
         if id != self.test_id {
             return;
         }
         self.w.kill_timer(T_SPIN);
         self.test = match result {
-            Ok(d) if self.page == OCR_PAGE => Test::Done(true, format!("连接正常，模型能看图，用时 {:.1} 秒", d.as_secs_f32())),
-            Ok(d) => Test::Done(true, format!("连接正常，用时 {:.1} 秒", d.as_secs_f32())),
-            Err(e) => Test::Done(false, e.to_string()),
+            Ok(m) => Test::Done(true, m),
+            Err(m) => Test::Done(false, m),
         };
         self.w.invalidate_all();
     }
 
     /// 「选择…」：用框里当前的地址和 Key 拉模型列表，拿到后弹下拉列表
-    fn start_models(&mut self) {
+    fn start_models(&mut self, ocr: bool) {
         if matches!(self.test, Test::Busy(_)) {
             return;
         }
-        let cfg = self.service();
+        let cfg = self.service(ocr);
         if cfg.endpoint.is_empty() {
             self.test = Test::Done(false, "请先填写服务地址".into());
             return;
@@ -757,11 +778,11 @@ impl Ui {
         let (id, w) = (self.busy("正在获取模型…"), self.w);
         std::thread::spawn(move || {
             let result = translate::list_models(&cfg, translate::TIMEOUT);
-            w.post(move |ui: &mut Ui, _| ui.listed(id, result));
+            w.post(move |ui: &mut Ui, _| ui.listed(id, ocr, result));
         });
     }
 
-    fn listed(&mut self, id: u32, result: Result<Vec<String>, translate::Error>) {
+    fn listed(&mut self, id: u32, ocr: bool, result: Result<Vec<String>, translate::Error>) {
         // 等的时候换了页的，结果在 reset_test 里已经丢掉了
         if id != self.test_id {
             return;
@@ -773,7 +794,7 @@ impl Ui {
             Ok(list) => {
                 self.test = Test::Idle;
                 self.models = list;
-                self.menu(Ctl::Models);
+                self.menu(Ctl::Models(ocr));
             }
             Err(e) => self.test = Test::Done(false, e.to_string()),
         }
@@ -835,8 +856,9 @@ impl Ui {
             sel_color: self.color,
             save_dir: self.save_dir.clone(),
             save_format: self.format,
-            ocr_endpoint: self.text(Child::OcrEndpoint).trim().to_string(),
-            ocr_model: self.text(Child::OcrModel).trim().to_string(),
+            // 开关关着：识别沿用翻译服务，单独填的 Key 留在系统里不动
+            ocr_endpoint: if self.ocr { self.text(Child::OcrEndpoint).trim().to_string() } else { String::new() },
+            ocr_model: if self.ocr { self.text(Child::OcrModel).trim().to_string() } else { String::new() },
             endpoint: self.text(Child::Endpoint).trim().to_string(),
             model: self.text(Child::Model).trim().to_string(),
             target: self.target,
@@ -850,6 +872,7 @@ impl Ui {
         for (c, old, which, name) in [(Child::Key, &self.key0, settings::TRANSLATE_KEY, "翻译"), (Child::OcrKey, &self.ocr_key0, settings::OCR_KEY, "文字识别")] {
             let key = self.text(c).trim().to_string();
             if key != *old
+                && (c == Child::Key || self.ocr)
                 && let Err(e) = plat::set_api_key(which, &key)
             {
                 errs.push(format!("{name}的 API Key 没有保存：{e}"));
@@ -873,9 +896,9 @@ impl Ui {
         let Some(mut r) = self.ctl_rect(c) else { return };
         let (options, cur): (Vec<String>, Option<usize>) = match c {
             // 模型列表对齐模型框弹出；手填的模型不在列表里就不打圆点
-            Ctl::Models => {
-                r.left = self.field(self.model_box()).left;
-                let typed = self.text(self.model_box());
+            Ctl::Models(ocr) => {
+                r.left = self.field(self.model_box(ocr)).left;
+                let typed = self.text(self.model_box(ocr));
                 (self.models.clone(), self.models.iter().position(|m| *m == typed.trim()))
             }
             _ => (TARGETS.iter().map(|t| t.1.to_string()).collect(), Some(TARGETS.iter().position(|t| t.0 == self.target).unwrap_or(0))),
@@ -884,7 +907,7 @@ impl Ui {
             .iter()
             .enumerate()
             .map(|(i, t)| {
-                let key = if c == Ctl::Models && t == translate::DEEPSEEK_MODEL { "推荐" } else { "" };
+                let key = if matches!(c, Ctl::Models(_)) && t == translate::DEEPSEEK_MODEL { "推荐" } else { "" };
                 MenuItem { checked: Some(i) == cur, ..MenuItem::new(i + 1, t, key) }
             })
             .collect();
@@ -896,7 +919,7 @@ impl Ui {
             }
             w.with(|ui: &mut Ui| {
                 match c {
-                    Ctl::Models => ui.set_text(ui.model_box(), &picked[id - 1]),
+                    Ctl::Models(ocr) => ui.set_text(ui.model_box(ocr), &picked[id - 1]),
                     _ => ui.target = TARGETS[id - 1].0,
                 }
                 ui.w.invalidate_all();
@@ -906,17 +929,6 @@ impl Ui {
 
     fn draw(&self, c: &Canvas) -> Option<()> {
         let s = self.scale;
-        let lw = s.round().max(1.0);
-        let fill = |r: RectF, col: u32| c.fill_rect(r, rgb(col));
-        // 整像素描边画在像素中心才不糊
-        let frame = |r: &Rect, radius: f32, bg: Option<u32>, line: u32, width: f32| {
-            let h = width / 2.0;
-            let rr = rectf(r.left as f32 + h, r.top as f32 + h, r.right as f32 - h, r.bottom as f32 - h);
-            if let Some(bg) = bg {
-                c.fill_round(rr, radius * s, rgb(bg));
-            }
-            c.stroke_round(rr, radius * s, rgb(line), width);
-        };
         let text = |t: &str, size: f32, bold: bool| Text::new(FONT, size * s, bold, t);
         // 一行字，(x, y) 是左上角（像素）；返回宽度
         let put = |t: &str, size: f32, bold: bool, x: f32, y: f32, color: u32| -> f32 {
@@ -930,256 +942,217 @@ impl Ui {
             c.text(&l, x, ((top + bottom - l.height()) / 2.0).round(), rgb(color));
             l.width()
         };
-        let label = |t: &str, row: f32| put_mid(t, 12.0, false, self.px(LX), self.px(row), self.px(row + 28.0), TEXT);
-        let hint = |t: &str, x: f32, y: f32, color: u32| -> f32 {
-            let Some(l) = Text::wrapped(FONT, 12.0 * s, false, t, self.px(RIGHT) - x, None) else { return 0.0 };
+        let label = |t: &str, row: f32| put_mid(t, 13.0, true, self.px(LX), self.px(row), self.px(row + FIELD_H), ui::INK);
+        // 说明字，折行到内容区右边；`mid` 有值时在这一行里上下居中
+        let hint = |t: &str, x: f32, y: f32, mid: Option<f32>, color: u32| {
+            let Some(l) = Text::wrapped(FONT, 12.0 * s, false, t, self.px(RIGHT) - x, None) else { return };
+            let y = mid.map_or(y, |b| ((y + b - l.height()) / 2.0).round());
             c.text(&l, x, y, rgb(color));
-            l.height()
         };
-        let state = |ctl: Ctl| match (self.hot == Some(ctl), self.down == Some(ctl)) {
-            (true, true) => 2,
-            (true, false) => 1,
-            _ => 0,
-        };
+        let st = |ctl: Ctl| ui::state(true, false, self.hot == Some(ctl), self.down == Some(ctl));
+        // 白底（或 `fill`）墨色描边的框：输入框、下拉框、分段、开关、色点
+        let boxed = |r: RectF, radius: f32, fill: u32| ui::block(c, r, radius, 0.0, fill, s);
+        // 带字按钮：主按钮紫底白字，其余白底墨字
         let button = |ctl: Ctl, t: &str, primary: bool| {
             let Some(r) = self.ctl_rect(ctl) else { return };
-            let st = state(ctl);
-            let (bg, line, color) = if primary {
-                ([ACCENT, ACCENT_HOVER, ACCENT_PRESS][st], [ACCENT, ACCENT_HOVER, ACCENT_PRESS][st], 0xFFFFFF)
-            } else {
-                ([0xFBFBFB, 0xF2F1F4, 0xE9E7EC][st], LINE, TEXT)
-            };
-            frame(&r, 4.0, Some(bg), line, lw);
-            let Some(l) = text(t, 12.0, primary) else { return };
-            let (x, y) = ((r.left + r.right) as f32 / 2.0 - l.width() / 2.0, (r.top + r.bottom) as f32 / 2.0 - l.height() / 2.0);
-            c.text(&l, x.round(), y.round(), rgb(color));
+            let face = if primary { ui::primary(c, rf(&r), st(ctl), s) } else { ui::secondary(c, rf(&r), st(ctl), s) };
+            let Some(l) = text(t, 13.0, true) else { return };
+            let (x, y) = ((face.left + face.right - l.width()) / 2.0, (face.top + face.bottom - l.height()) / 2.0);
+            c.text(&l, x.round(), y.round(), rgb(if primary { 0xFFFFFF } else { ui::INK }));
         };
         let dropdown = |ctl: Ctl, t: &str| {
             let Some(r) = self.ctl_rect(ctl) else { return };
-            frame(&r, 4.0, Some(if state(ctl) > 0 { 0xF2F1F4 } else { 0xFBFBFB }), LINE, lw);
-            let Some(l) = text(t, 12.0, false) else { return };
-            let icon_x = r.right as f32 - self.px(6.0) - self.px(14.0);
-            l.truncate(icon_x - self.px(12.0) - r.left as f32 - self.px(10.0));
-            c.text(&l, r.left as f32 + self.px(10.0), ((r.top + r.bottom) as f32 - l.height()) / 2.0, rgb(TEXT));
-            ui::icon(c, "chev_down", icon_x, (r.top + r.bottom) as f32 / 2.0 - 7.0 * s, 14.0 * s, rgb(HINT));
+            boxed(rf(&r), 7.0, if self.hot == Some(ctl) { ui::HOVER } else { ui::SURF });
+            let Some(l) = text(t, 13.0, false) else { return };
+            let icon_x = r.right as f32 - self.px(8.0) - self.px(16.0);
+            l.truncate(icon_x - self.px(8.0) - r.left as f32 - self.px(10.0));
+            c.text(&l, r.left as f32 + self.px(10.0), ((r.top + r.bottom) as f32 - l.height()) / 2.0, rgb(ui::INK));
+            ui::icon(c, "chev_down", icon_x, (r.top + r.bottom) as f32 / 2.0 - 8.0 * s, 16.0 * s, rgb(ui::INK));
         };
-        let focus = self.w.focused_field();
-        // 分段按钮：`rs` 是各段的位置，选中那段浅紫底、紫字
-        let segments = |rs: &[Rect], labels: &[&str], sel: usize| {
+        // 分段：白底墨色描边，选中那段墨底白字；右边跟一句说明。`ctl` 是第 i 段的控件
+        let segments = |ctl: fn(usize) -> Ctl, labels: &[&str], sel: usize, note: &str| {
+            let rs: Vec<Rect> = (0..labels.len()).filter_map(|i| self.ctl_rect(ctl(i))).collect();
             let (Some(a), Some(b)) = (rs.first(), rs.last()) else { return };
-            let whole = Rect { left: a.left, top: a.top, right: b.right, bottom: a.bottom };
-            frame(&whole, 4.0, Some(0xFFFFFF), LINE, lw);
-            // 选中那段的底色只填在它自己那块，外侧的圆角跟着外框
-            c.push_clip(rf(&rs[sel]));
-            c.fill_round(rectf(whole.left as f32 + lw, whole.top as f32 + lw, whole.right as f32 - lw, whole.bottom as f32 - lw), 3.0 * s, rgb(ACCENT_SOFT));
-            c.pop_clip();
-            for r in &rs[1..] {
-                fill(rectf(r.left as f32, r.top as f32, r.left as f32 + lw, r.bottom as f32), LINE);
-            }
+            let p = self.px(3.0);
+            let whole = rectf(a.left as f32 - p, a.top as f32 - p, b.right as f32 + p, a.bottom as f32 + p);
+            boxed(whole, 7.0, ui::SURF);
             for (i, r) in rs.iter().enumerate() {
                 let on = i == sel;
-                let Some(l) = text(labels[i], 12.0, on) else { continue };
-                let x = (r.left + r.right) as f32 / 2.0 - l.width() / 2.0;
-                c.text(&l, x.round(), ((r.top + r.bottom) as f32 / 2.0 - l.height() / 2.0).round(), rgb(if on { ACCENT } else { TEXT }));
+                if on || self.hot == Some(ctl(i)) {
+                    c.fill_round(rf(r), 5.0 * s, rgb(if on { ui::INK } else { ui::HOVER }));
+                }
+                let Some(l) = text(labels[i], 12.5, true) else { continue };
+                let (x, y) = ((r.left + r.right) as f32 / 2.0 - l.width() / 2.0, (r.top + r.bottom) as f32 / 2.0 - l.height() / 2.0);
+                c.text(&l, x.round(), y.round(), rgb(if on { 0xFFFFFF } else { ui::MUTED }));
             }
+            put_mid(note, 12.0, false, whole.right + self.px(10.0), whole.top, whole.bottom, ui::MUTED);
         };
-        // 开关：开是主题色底、白点在右，关是白底灰边、灰点在左；右边一行说明，和标签 `row` 对齐
+        // 开关 44 × 24：关是白底，开是紫底，白色圆点墨色描边；右边一句说明，和这一行 `row` 对齐
         let switch = |ctl: Ctl, on: bool, note: &str, row: f32| {
             let Some(r) = self.ctl_rect(ctl) else { return };
-            frame(&r, 10.0, Some(if on { ACCENT } else { 0xFFFFFF }), if on { ACCENT } else { 0x8A8590 }, lw);
-            let cx = r.left as f32 + if on { 29.0 } else { 9.0 } * s;
-            c.fill_ellipse(cx, (r.top + r.bottom) as f32 / 2.0, 5.0 * s, 5.0 * s, rgb(if on { 0xFFFFFF } else { HINT }));
-            put_mid(note, 12.0, false, r.right as f32 + self.px(8.0), self.px(row), self.px(row + 28.0), HINT);
+            boxed(rf(&r), 12.0, if on { ui::ACCENT } else if self.hot == Some(ctl) { ui::HOVER } else { ui::SURF });
+            let (d, y) = (18.0 * s, (r.top + r.bottom) as f32 / 2.0 - 9.0 * s);
+            let x = r.left as f32 + if on { 23.0 } else { 3.0 } * s;
+            boxed(rectf(x, y, x + d, y + d), 9.0, ui::SURF);
+            put_mid(note, 13.0, false, r.right as f32 + self.px(10.0), self.px(row), self.px(row + FIELD_H), ui::INK);
         };
-        // 快捷键框下面那行字
-        let hotkey_hint = |ch: Child, orig: Hotkey| {
-            let changed = self.read_hotkey(ch).is_some_and(|h| h != orig);
+        let focus = self.w.focused_field();
+        // 两个快捷键框下面共用一行字：有问题的写原因（红框标在那个框上），正在按的写要求，改过的提示点确定
+        let hotkey_hint = || {
+            let keys = [(Child::Hotkey, self.orig.hotkey), (Child::RecHotkey, self.orig.record_hotkey)];
+            let typing = keys.iter().any(|(ch, _)| focus == Some(*ch as usize));
+            let changed = keys.iter().any(|(ch, orig)| self.read_hotkey(*ch).is_some_and(|h| h != *orig));
             let (msg, color) = match &self.hk_bad {
-                Some((bad, m)) if *bad == ch => (m.as_str(), ERR),
-                _ if focus == Some(ch as usize) => (if cfg!(target_os = "macos") { "请按下新的组合键，需要包含 ⌃、⌥ 或 ⌘" } else { "请按下新的组合键，需要包含 Ctrl 或 Alt" }, HINT),
-                _ if changed => ("点「确定」后生效", HINT),
-                _ => ("点一下输入框，再按新的组合键", HINT),
+                Some((_, m)) => (m.as_str(), ERR_TEXT),
+                None if typing => (if cfg!(target_os = "macos") { "请按下新的组合键，需要包含 ⌃、⌥ 或 ⌘" } else { "请按下新的组合键，需要包含 Ctrl 或 Alt" }, ui::MUTED),
+                None if changed => ("点「确定」后生效", ui::MUTED),
+                None => ("点一下输入框，再按新的组合键；两个不能相同", ui::MUTED),
             };
-            hint(msg, self.px(CX), self.px(ROW0 + 34.0), color);
+            hint(msg, self.px(CX), self.px(REC_Y + 38.0), None, color);
         };
-        // 「测试连接」和右边的结果：翻译页、文字识别页共用
+        // 「测试连接」和右边的结果
         let test_row = || -> Option<()> {
             button(Ctl::Test, "测试连接", false);
-            let Some(r) = self.ctl_rect(Ctl::Test) else { return Some(()) };
-            let x = r.right as f32 + self.px(8.0);
+            let r = self.ctl_rect(Ctl::Test)?;
+            let x = r.right as f32 + self.px(12.0);
             let (top, bottom) = (r.top as f32, r.bottom as f32);
             match &self.test {
                 Test::Idle => {}
                 Test::Busy(msg) => {
-                    ui::spinner(c, x, ((top + bottom) / 2.0 - 8.0 * s).round(), s, self.angle, rgb(0xEBDDFB), rgb(ACCENT));
-                    put_mid(msg, 12.0, false, x + self.px(22.0), top, bottom, HINT);
+                    ui::spinner(c, x, ((top + bottom) / 2.0 - 8.0 * s).round(), s, self.angle, rgb(ui::HOVER), rgb(ui::ACCENT));
+                    put_mid(msg, 12.0, false, x + self.px(22.0), top, bottom, ui::MUTED);
                 }
                 Test::Done(ok, msg) => {
                     // 第一行和按钮文字对齐，长的错误原因往下折行
-                    let l = Text::wrapped(FONT, 12.0 * s, false, msg, self.px(RIGHT) - x, None)?;
+                    let l = Text::wrapped(FONT, 12.0 * s, true, msg, self.px(RIGHT) - x, None)?;
                     let h = l.first_line_height();
-                    c.text(&l, x, ((top + bottom - h) / 2.0).round(), rgb(if *ok { OK } else { ERR }));
+                    c.text(&l, x, ((top + bottom - h) / 2.0).round(), rgb(if *ok { OK_TEXT } else { ERR_TEXT }));
                 }
             }
             Some(())
         };
 
-        c.clear(rgb(0xFFFFFF));
-        // 左侧导航
-        let (main_h, nav_w, win_w) = (self.px(MAIN_H), self.px(NAV_W), self.px(WIN_W));
-        fill(rectf(0.0, 0.0, nav_w, main_h), 0xFAF9FB);
-        fill(rectf(nav_w - lw, 0.0, nav_w, main_h), 0xEEEDF0);
-        for (i, name) in PAGES.iter().enumerate() {
+        c.clear(rgb(ui::CREAM));
+        // 左边导航：当前页柠檬黄块加 2,2 实心阴影
+        for (i, (name, icon)) in PAGES.iter().enumerate() {
             let Some(r) = self.ctl_rect(Ctl::Nav(i)) else { continue };
             let on = i == self.page;
-            if on || state(Ctl::Nav(i)) > 0 {
-                c.fill_round(rf(&r), 4.0 * s, rgb(if on { ACCENT_SOFT } else { 0xEFEDF2 }));
+            if on {
+                ui::block(c, rf(&r), 7.0, 2.0, ui::PICK, s);
+            } else if self.hot == Some(Ctl::Nav(i)) {
+                c.fill_round(rf(&r), 7.0 * s, rgb(if self.down == Some(Ctl::Nav(i)) { ui::PRESS } else { ui::HOVER }));
             }
-            put_mid(name, 13.0, on, r.left as f32 + self.px(12.0), r.top as f32, r.bottom as f32, if on { ACCENT } else { TEXT });
+            let fg = if on { ui::INK } else { ui::MUTED };
+            ui::icon(c, icon, r.left as f32 + self.px(12.0), (r.top + r.bottom) as f32 / 2.0 - 10.0 * s, 20.0 * s, rgb(fg));
+            put_mid(name, 13.5, true, r.left as f32 + self.px(42.0), r.top as f32, r.bottom as f32, fg);
         }
-        // 页标题
-        put(PAGES[self.page], 18.0, true, self.px(LX), self.px(18.0), TEXT);
+        // 右边白色面板和页标题
+        ui::block(c, rectf(self.px(NAV_W), self.px(4.0), self.px(PANEL_R), self.px(MAIN_H)), 12.0, 4.0, ui::SURF, s);
+        put(PAGES[self.page].0, 20.0, true, self.px(LX), self.px(24.0), ui::INK);
         match self.page {
-            SHOT_PAGE => {
-                label("快捷键", ROW0);
-                hotkey_hint(Child::Hotkey, self.orig.hotkey);
-                label("开机启动", 120.0);
-                switch(Ctl::Toggle, self.autostart, "开机时自动启动 Jie", 120.0);
-                put("选区颜色", 12.0, false, self.px(LX), self.px(SW_Y + 5.0), TEXT);
+            GENERAL_PAGE => {
+                label("截图快捷键", ROW0);
+                label("录屏快捷键", REC_Y);
+                hotkey_hint();
+                label("开机启动", AUTO_Y);
+                switch(Ctl::Toggle, self.autostart, "开机时自动启动 Jie", AUTO_Y);
+                label("选区颜色", SW_Y);
                 let cur = self.swatch();
                 for i in 0..8 {
                     let Some(r) = self.ctl_rect(Ctl::Swatch(i)) else { continue };
+                    if self.hot == Some(Ctl::Swatch(i)) {
+                        c.fill_round(rf(&r), 7.0 * s, rgb(ui::HOVER));
+                    }
                     let (cx, cy) = ((r.left + r.right) as f32 / 2.0, (r.top + r.bottom) as f32 / 2.0);
-                    let custom_set = i == 7 && cur == 7;
-                    let color = match PRESETS.get(i) {
-                        Some(p) => p.1,
-                        None if custom_set => self.color,
-                        None => 0xFFFFFF,
-                    };
-                    c.fill_ellipse(cx, cy, 12.0 * s, 12.0 * s, rgb(color));
-                    let edge = if i == 7 && !custom_set { rgb(0x8A8590) } else { rgba(0, 0.18) };
-                    c.stroke_ellipse(cx, cy, 11.5 * s, 11.5 * s, edge, 1.0 * s, Stroke::Plain);
+                    // 最后一格：没选自定义颜色时是加号
+                    match PRESETS.get(i).map(|p| p.1).or((cur == 7).then_some(self.color)) {
+                        Some(col) => boxed(rectf(cx - 10.0 * s, cy - 10.0 * s, cx + 10.0 * s, cy + 10.0 * s), 10.0, col),
+                        None => ui::icon(c, "plus", cx - 10.0 * s, cy - 10.0 * s, 20.0 * s, rgb(ui::INK)),
+                    }
                     if i == cur {
-                        // 选中：外面隔 2 的白，再一圈 1.5 的深色
-                        c.stroke_ellipse(cx, cy, 14.75 * s, 14.75 * s, rgb(TEXT), 1.5 * s, Stroke::Plain);
-                    }
-                    if i == 7 && !custom_set {
-                        let Some(l) = text("+", 15.0, true) else { continue };
-                        c.text(&l, cx - l.width() / 2.0, cy - l.height() / 2.0, rgb(HINT));
+                        // 选中：隔 2 的白，再一圈 2 墨色
+                        c.stroke_ellipse(cx, cy, 13.0 * s, 13.0 * s, rgb(ui::INK), ui::line_w(s), Stroke::Plain);
                     }
                 }
-                let mut y = SW_Y + 24.0 + 6.0;
                 if self.picker {
-                    self.draw_picker(c, lw)?;
-                    y = PICK_Y + 198.0 + 6.0;
+                    self.draw_picker(c)?;
+                } else {
+                    hint("用在选区边框、手柄、窗口高亮、录屏边框和钉图描边上", self.px(CX), self.px(SW_Y + 40.0), None, ui::MUTED);
                 }
-                hint("用在选区边框、手柄、窗口高亮、录屏边框、选中标注的虚线框和钉图描边上", self.px(CX), self.px(y), HINT);
             }
-            REC_PAGE => {
-                label("快捷键", ROW0);
-                hotkey_hint(Child::RecHotkey, self.orig.record_hotkey);
-                label("帧率", 126.0);
-                let mut rs = Vec::new();
-                for i in 0..FPS_CHOICES.len() {
-                    rs.extend(self.ctl_rect(Ctl::Fps(i)));
-                }
-                let labels: Vec<String> = FPS_CHOICES.iter().map(|f| f.to_string()).collect();
-                segments(&rs, &labels.iter().map(String::as_str).collect::<Vec<_>>(), self.fps_index());
-                if let Some(b) = rs.last() {
-                    put_mid("帧 / 秒", 12.0, false, b.right as f32 + self.px(8.0), b.top as f32, b.bottom as f32, HINT);
-                }
-                hint("帧率越高越流畅，GIF 文件也越大。区域大、画面变化多时，实际帧率会低一些。", self.px(CX), self.px(160.0), HINT);
-                label("动图边框", 212.0);
-                switch(Ctl::GifFrame, self.gif_frame, "录好的 GIF 钉在屏幕上时，外面画一圈选区颜色的框", 212.0);
-                hint(
-                    "按快捷键后框选要录的区域（可以吸附窗口和页面里的边界），点「开始录制」马上开始，旁边的秒表按钮可以选延时 3、5、10 秒；\
-                     录制中再按一次快捷键，或点控制条上的「停止」。录好的 GIF 在原位置播放，可以复制、保存或钉在屏幕上。",
-                    self.px(CX),
-                    self.px(262.0),
-                    HINT,
-                );
-            }
-            SAVE_PAGE => {
-                label("默认位置", ROW0);
+            CAPTURE_PAGE => {
+                label("保存位置", ROW0);
                 button(Ctl::Browse, "浏览…", false);
-                hint("每次保存后会自动记成上次用的文件夹", self.px(CX), self.px(98.0), HINT);
-                label("格式", 126.0);
-                if let (Some(a), Some(b)) = (self.ctl_rect(Ctl::Format(0)), self.ctl_rect(Ctl::Format(1))) {
-                    segments(&[a, b], &["PNG", "JPEG"], self.format_index());
-                    put_mid("JPEG 质量固定 90", 12.0, false, b.right as f32 + self.px(8.0), b.top as f32, b.bottom as f32, HINT);
-                }
-            }
-            OCR_PAGE => {
-                label("服务地址", 58.0);
-                label("模型", 98.0);
-                button(Ctl::Models, "选择…", false);
-                label("API Key", 138.0);
-                hint("截图会发给这个服务识别，三项都留空就用翻译页的。", self.px(CX), self.px(172.0), HINT);
-                test_row()?;
+                hint("每次保存后会自动记成上次用的文件夹", self.px(CX), self.px(ROW0 + 38.0), None, ui::MUTED);
+                label("图片格式", 136.0);
+                segments(Ctl::Format, &FORMATS, self.format_index(), "JPEG 质量固定 90");
+                label("录屏帧率", 180.0);
+                let fps = FPS_CHOICES.map(|f| f.to_string());
+                segments(Ctl::Fps, &fps.each_ref().map(String::as_str), self.fps_index(), "帧 / 秒");
+                hint("越高越流畅，GIF 也越大；区域大、画面变化多时实际帧率会低一些。", self.px(CX), self.px(218.0), None, ui::MUTED);
+                label("动图边框", 268.0);
+                switch(Ctl::GifFrame, self.gif_frame, "录好的 GIF 外面画一圈选区颜色的框", 268.0);
             }
             _ => {
-                label("服务地址", 58.0);
-                label("模型", 98.0);
-                button(Ctl::Models, "选择…", false);
-                label("API Key", 138.0);
-                label("译成", 178.0);
+                label("服务地址", ROW0);
+                label("模型", ROW0 + 44.0);
+                button(Ctl::Models(false), "选择…", false);
+                label("API Key", ROW0 + 88.0);
+                label("译成", ROW0 + 132.0);
                 dropdown(Ctl::Target, self.target_label());
                 if let Some(r) = self.ctl_rect(Ctl::Target) {
-                    let t = self.target_hint();
-                    if self.hint_wraps() {
-                        hint(t, self.px(CX), r.bottom as f32 + self.px(6.0), HINT);
-                    } else {
-                        put_mid(t, 12.0, false, r.right as f32 + self.px(8.0), r.top as f32, r.bottom as f32, HINT);
-                    }
+                    hint(self.target_hint(), r.right as f32 + self.px(10.0), r.top as f32, Some(r.bottom as f32), ui::MUTED);
+                }
+                label("文字识别", OCR_Y);
+                switch(Ctl::Ocr, self.ocr, "另用一家服务识别文字", OCR_Y);
+                if self.ocr {
+                    label("识别地址", OCR_Y + 44.0);
+                    label("识别模型", OCR_Y + 88.0);
+                    button(Ctl::Models(true), "选择…", false);
+                    label("识别 Key", OCR_Y + 132.0);
+                } else {
+                    hint("关着时用上面的服务识别文字，模型要能看图", self.px(CX), self.px(OCR_Y + 38.0), None, ui::MUTED);
                 }
                 test_row()?;
             }
         }
-        // 系统控件的外框（画在页面内容之后，取色器的底色才不会盖住色值框）：平时 1px，聚焦时 2px 主题色，快捷键有问题时 2px 红
+        // 系统控件的外框（画在页面内容之后，取色器的底色才不会盖住色值框）：白底墨色描边，聚焦时外面一圈浅紫，快捷键有问题时一圈红
         for ch in CHILDREN.into_iter().filter(|ch| self.visible(*ch)) {
-            let r = self.field(ch);
+            let r = rf(&self.field(ch));
             let bad = self.hk_bad.as_ref().is_some_and(|(c, _)| *c == ch);
-            let (line, width) = if bad {
-                (ERR, 2.0 * lw)
-            } else if focus == Some(ch as usize) {
-                (ACCENT, 2.0 * lw)
-            } else {
-                (LINE, lw)
-            };
-            frame(&r, 4.0, Some(0xFFFFFF), line, width);
+            if bad || focus == Some(ch as usize) {
+                let g = self.px(3.0);
+                let o = rectf(r.left - g / 2.0, r.top - g / 2.0, r.right + g / 2.0, r.bottom + g / 2.0);
+                c.stroke_round(o, 7.0 * s + g / 2.0, rgb(if bad { ui::ERR } else { ui::PRESS }), g);
+            }
+            boxed(r, 7.0, ui::SURF);
         }
         // 底栏
-        fill(rectf(0.0, main_h, win_w, self.px(MAIN_H + FOOT_H)), 0xF7F6F9);
-        fill(rectf(0.0, main_h, win_w, main_h + lw), 0xEEEDF0);
-        put_mid(concat!("Jie ", env!("CARGO_PKG_VERSION")), 12.0, false, self.px(24.0), main_h, self.px(MAIN_H + FOOT_H), HINT);
+        put_mid(concat!("Jie ", env!("CARGO_PKG_VERSION")), 12.0, false, self.px(20.0), self.px(MAIN_H + 4.0), self.px(MAIN_H + FOOT_H), ui::MUTED);
         button(Ctl::Ok, "确定", true);
         button(Ctl::Cancel, "取消", false);
-        // 键盘焦点框：2px 主题色，离控件 1
+        // 键盘焦点框：2 主题紫，离控件 2
         if self.kbd
             && self.w.focused()
             && let Some(ctl) = self.focus
             && let Some(r) = self.ctl_rect(ctl)
         {
-            let g = 2.0 * lw;
-            let o = Rect { left: r.left - g as i32, top: r.top - g as i32, right: r.right + g as i32, bottom: r.bottom + g as i32 };
+            let (g, lw) = (self.px(3.0), ui::line_w(s));
+            let o = rectf(r.left as f32 - g, r.top as f32 - g, r.right as f32 + g, r.bottom as f32 + g);
             let radius = match ctl {
                 Ctl::Swatch(_) => 16.0,
-                Ctl::Toggle | Ctl::GifFrame => 12.0,
-                _ => 6.0,
+                Ctl::Toggle | Ctl::GifFrame | Ctl::Ocr => 14.0,
+                _ => 9.0,
             };
-            frame(&o, radius, None, ACCENT, g);
+            c.stroke_round(rectf(o.left + lw / 2.0, o.top + lw / 2.0, o.right - lw / 2.0, o.bottom - lw / 2.0), radius * s, rgb(ui::ACCENT), lw);
         }
         Some(())
     }
 
     /// 取色器：饱和度/明度方块 + 色相条 + 预览色块（色值输入框是系统控件）
-    fn draw_picker(&self, c: &Canvas, lw: f32) -> Option<()> {
+    fn draw_picker(&self, c: &Canvas) -> Option<()> {
         let s = self.scale;
-        let boxr = self.rect(CX, PICK_Y, CX + 222.0, PICK_Y + 198.0);
-        let h = lw / 2.0;
-        let rr = rectf(boxr.left as f32 + h, boxr.top as f32 + h, boxr.right as f32 - h, boxr.bottom as f32 - h);
-        c.fill_round(rr, 6.0 * s, rgb(0xFCFBFD));
-        c.stroke_round(rr, 6.0 * s, rgb(0xE6E3EA), lw);
+        ui::block(c, rf(&self.rect(CX, PICK_Y, CX + 222.0, PICK_Y + 198.0)), 7.0, 0.0, ui::SURF, s);
         let (Some(sv), Some(hue)) = (self.ctl_rect(Ctl::Sv), self.ctl_rect(Ctl::Hue)) else { return Some(()) };
         // 方块和色相条逐像素算出来，每次重画都重新生成（只有几万个像素）
         let bitmap = |r: &Rect, f: &dyn Fn(f32, f32) -> u32| {
@@ -1208,9 +1181,7 @@ impl Ui {
         c.stroke_rect(rectf(x - 2.5 * s, t + 0.5 * s, x + 2.5 * s, b - 0.5 * s), dark, 1.0 * s, Stroke::Plain);
         c.pop_clip();
         // 预览色块
-        let p = self.rect(CX + 11.0, PICK_Y + 159.0, CX + 39.0, PICK_Y + 187.0);
-        c.fill_round(rf(&p), 4.0 * s, rgb(self.color));
-        c.stroke_round(rectf(p.left as f32 + h, p.top as f32 + h, p.right as f32 - h, p.bottom as f32 - h), 4.0 * s, rgba(0, 0.18), lw);
+        ui::block(c, rf(&self.rect(CX + 11.0, PICK_Y + 159.0, CX + 39.0, PICK_Y + 187.0)), 5.0, 0.0, self.color, s);
         Some(())
     }
 }
@@ -1305,6 +1276,7 @@ impl Handler for Ui {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn hsv_round_trip() {
@@ -1371,7 +1343,7 @@ mod tests {
         use crate::translate::tests::{http, mock};
 
         let (w, ui, dir) = open("settings");
-        ui.set_page(TR_PAGE);
+        ui.set_page(SERVICE_PAGE);
         assert_eq!((ui.text(Child::Endpoint).as_str(), ui.text(Child::Model).as_str()), (translate::DEEPSEEK, translate::DEEPSEEK_MODEL));
 
         // 菜单弹出来以后另一个线程截屏，再按 ↓↓ Enter 选第二个
@@ -1379,7 +1351,7 @@ mod tests {
         let (base, _req) = mock(Some(http("200 OK", body)));
         ui.set_text(Child::Endpoint, &base);
         let picker = plat::answer_menu(w, Some(dir.join("models-menu.png")), &[Key::Down, Key::Down, Key::Enter]);
-        w.with(|ui: &mut Ui| ui.click(Ctl::Models));
+        w.with(|ui: &mut Ui| ui.click(Ctl::Models(false)));
         wait(ui, |u| u.text(Child::Model) == "deepseek-v4-pro");
         picker.join().unwrap();
         assert!(matches!(ui.test, Test::Idle));
@@ -1387,77 +1359,83 @@ mod tests {
         // Key 错：原因写在测试连接那一行
         let (bad, _req) = mock(Some(http("401 Unauthorized", r#"{"error":{"message":"bad key"}}"#)));
         ui.set_text(Child::Endpoint, &bad);
-        w.with(|ui: &mut Ui| ui.click(Ctl::Models));
+        w.with(|ui: &mut Ui| ui.click(Ctl::Models(false)));
         wait(ui, |u| matches!(&u.test, Test::Done(false, m) if m == "API Key 无效（401），请到设置里检查。"));
         w.close();
     }
 
-    /// 文字识别页走一遍：三个框 → 测试连接发的是图片、用这页填的服务 →
-    /// 留空时用翻译页的地址、Key → 模型不收图片时写原因。截图放 target/test-tmp/settings-ocr，平时不跑：
-    /// cargo test ocr_page -- --ignored --nocapture
+    /// 停一会儿让窗口画完
+    fn settle(ui: &Ui) {
+        let t0 = Instant::now();
+        wait(ui, |_| t0.elapsed() > Duration::from_millis(300));
+    }
+
+    /// 识别服务：开关打开才多出三项 → 测试连接先测翻译服务、再发图片给识别服务（用那边的模型和 Key）→
+    /// 识别地址、Key 留空时图片发给翻译服务 → 模型不收图片时写原因 → 关掉开关三项藏起来。
+    /// 截图放 target/test-tmp/settings-ocr，平时不跑：cargo test ocr_service -- --ignored
     #[test]
     #[ignore]
-    fn ocr_page() {
+    fn ocr_service() {
         use crate::translate::tests::{http, mock};
         let (w, ui, dir) = open("settings-ocr");
-        let settle = |ui: &Ui| {
-            let t0 = Instant::now();
-            wait(ui, |_| t0.elapsed() > Duration::from_millis(300));
-        };
-        w.with(|ui: &mut Ui| ui.set_page(OCR_PAGE));
+        w.with(|ui: &mut Ui| ui.set_page(SERVICE_PAGE));
+        assert!(!ui.ocr && !ui.visible(Child::OcrEndpoint));
+        w.with(|ui: &mut Ui| ui.click(Ctl::Ocr));
         settle(ui);
         shoot(w.rect(), &dir.join("1-page.png"));
         assert!(ui.visible(Child::OcrEndpoint) && ui.visible(Child::OcrKey));
 
-        // 单独填的服务：发图片、用这页的模型和 Key
         let ok = r#"{"choices":[{"message":{"content":""}}]}"#;
+        let (tr, tr_req) = mock(Some(http("200 OK", ok)));
+        ui.set_text(Child::Endpoint, &tr);
+        ui.set_text(Child::Key, "sk-tr-test");
         let (base, req) = mock(Some(http("200 OK", ok)));
         ui.set_text(Child::OcrEndpoint, &base);
         ui.set_text(Child::OcrModel, "vl-1");
         ui.set_text(Child::OcrKey, "sk-ocr-test");
         w.with(|ui: &mut Ui| ui.click(Ctl::Test));
         wait(ui, |u| matches!(&u.test, Test::Done(..)));
-        assert!(matches!(&ui.test, Test::Done(true, m) if m.starts_with("连接正常，模型能看图")));
+        assert!(matches!(&ui.test, Test::Done(true, m) if m.starts_with("连接正常，识别模型能看图")));
+        let r = tr_req.recv().unwrap();
+        assert!(!r.contains("data:image") && r.to_lowercase().contains("bearer sk-tr-test"), "{r}");
         let r = req.recv().unwrap();
         assert!(r.contains("data:image/png;base64,") && r.contains("\"vl-1\"") && r.to_lowercase().contains("bearer sk-ocr-test"), "{r}");
 
-        // 地址、Key 留空：用翻译页的
-        let (base, req) = mock(Some(http("200 OK", ok)));
-        ui.set_text(Child::Endpoint, &base);
-        ui.set_text(Child::Key, "sk-tr-test");
+        // 地址、Key 留空：图片也发给翻译服务，带翻译的 Key
         ui.set_text(Child::OcrEndpoint, "");
         ui.set_text(Child::OcrKey, "");
         w.with(|ui: &mut Ui| ui.click(Ctl::Test));
         wait(ui, |u| matches!(&u.test, Test::Done(true, _)));
-        let r = req.recv().unwrap();
-        assert!(r.contains("\"vl-1\"") && r.to_lowercase().contains("bearer sk-tr-test"), "{r}");
+        let _ping = tr_req.recv().unwrap();
+        let r = tr_req.recv().unwrap();
+        assert!(r.contains("data:image") && r.contains("\"vl-1\"") && r.to_lowercase().contains("bearer sk-tr-test"), "{r}");
 
         // 模型不收图片
         let (bad, _req) = mock(Some(http("400 Bad Request", r#"{"error":{"message":"image input is not supported by this model"}}"#)));
         ui.set_text(Child::OcrEndpoint, &bad);
         ui.set_text(Child::OcrKey, "sk-ocr-test");
         w.with(|ui: &mut Ui| ui.click(Ctl::Test));
-        wait(ui, |u| matches!(&u.test, Test::Done(false, m) if m.contains("image input is not supported")));
+        wait(ui, |u| matches!(&u.test, Test::Done(false, m) if m.starts_with("识别服务：") && m.contains("image input is not supported")));
         settle(ui);
-        shoot(w.rect(), &dir.join("4-no-image.png"));
+        shoot(w.rect(), &dir.join("2-no-image.png"));
 
-        // 翻页再回来，测试结果清掉
-        w.with(|ui: &mut Ui| ui.set_page(TR_PAGE));
-        assert!(matches!(ui.test, Test::Idle));
+        // 关掉开关：三项藏起来，测试结果清掉
+        w.with(|ui: &mut Ui| ui.click(Ctl::Ocr));
+        assert!(!ui.visible(Child::OcrEndpoint) && matches!(ui.test, Test::Idle));
         w.close();
     }
 
-    /// 录屏页：截图存 target/test-tmp/settings-rec；录屏快捷键和截图的一样时「确定」被拦下（这时还没注册任何快捷键），
-    /// 翻到录屏页、红框标在录屏快捷键上；帧率分段可以用方向键换。平时不跑：cargo test record_page -- --ignored
+    /// 截图与录屏页、常规页：截图存 target/test-tmp/settings-rec；帧率分段可以用方向键换；
+    /// 录屏快捷键和截图的一样时「确定」被拦下（这时还没注册任何快捷键），翻到常规页、红框标在录屏快捷键上。
+    /// 平时不跑：cargo test capture_page -- --ignored
     #[test]
     #[ignore]
-    fn record_page() {
+    fn capture_page() {
         let (w, ui, dir) = open("settings-rec");
-        w.with(|ui: &mut Ui| ui.set_page(REC_PAGE));
-        let t0 = Instant::now();
-        wait(ui, |_| t0.elapsed() > Duration::from_millis(300));
+        w.with(|ui: &mut Ui| ui.set_page(CAPTURE_PAGE));
+        settle(ui);
         shoot(w.rect(), &dir.join("1-page.png"));
-        assert!(ui.visible(Child::RecHotkey) && !ui.visible(Child::Hotkey));
+        assert!(ui.visible(Child::SaveDir) && !ui.visible(Child::Hotkey));
         assert_eq!(ui.fps, 15);
         w.with(|ui: &mut Ui| {
             ui.focus = Some(Ctl::Fps(1));
@@ -1466,15 +1444,14 @@ mod tests {
         assert_eq!(ui.fps, 20);
         let hk = ui.orig.hotkey;
         w.set_hotkey_field(Child::RecHotkey as usize, hk.mods, hk.vk);
-        w.with(|ui: &mut Ui| {
-            ui.set_page(SHOT_PAGE);
-            ui.apply();
-        });
+        w.with(|ui: &mut Ui| ui.apply());
         assert!(matches!(&ui.hk_bad, Some((Child::RecHotkey, m)) if m.contains("重复")));
-        assert_eq!(ui.page, REC_PAGE);
-        let t0 = Instant::now();
-        wait(ui, |_| t0.elapsed() > Duration::from_millis(200));
+        assert_eq!(ui.page, GENERAL_PAGE);
+        settle(ui);
         shoot(w.rect(), &dir.join("2-duplicate.png"));
+        w.with(|ui: &mut Ui| ui.click(Ctl::Swatch(7)));
+        settle(ui);
+        shoot(w.rect(), &dir.join("3-picker.png"));
         w.close();
     }
 }

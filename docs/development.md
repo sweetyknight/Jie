@@ -48,7 +48,11 @@ sh scripts/macos/test.sh
 
 界面回归会短暂打开独立测试应用，检查设置、登录项、保存对话框、PNG/JPEG、钉图、剪贴板、快捷键和输入法。配置写入 `target/test-tmp/mac-smoke`，不读取个人 API Key，检查后恢复剪贴板和测试登录项；采用临时签名，不访问签名证书，也不需要屏幕录制权限。
 
-`cargo test` 默认跳过标为 `ignored` 的交互、性能和在线测试。按需运行指定测试；在线测试会调用配置的服务，不要直接批量运行全部忽略项。
+`cargo test` 默认跳过标为 `ignored` 的交互、性能和在线测试。交互测试会盖住屏幕一会儿，按模块一起跑，一次一个（例如 `cargo test overlay:: -- --ignored --test-threads 1`），样张存在 `target/test-tmp/` 下。在线测试（`llm_samples` 等）会调用设置里的服务、按量计费，不要直接批量运行全部忽略项。
+
+- 吸附：`cargo test dump_screen -- --ignored` 存几张真实屏幕，`cargo test real_screens -- --ignored --nocapture` 打印每个点的层次并画出默认那层（`target/test-tmp/snap/`）。
+- 录屏界面：`cargo test record_flow -- --ignored` 截下真实屏幕存成 `target/test-tmp/record/scene-*.png`，并检查 GIF 第一行不是边框颜色。框满整块屏幕的两种入口要用发布版（调试版编一帧 4K 要好几秒）：`cargo test --release full_screen -- --ignored --nocapture --test-threads 1`，控制条压在任务栏上、截屏截得到，它底下的色块录到一半由绿变橙，GIF 首帧那块是绿的、末帧是橙的。
+- 录屏资源：`cargo test --release measure_ -- --ignored --nocapture --test-threads 1`（`measure_4_pins` 要在 `measure_2_scroll` 之后），结果另存在 `target/test-tmp/measure/*.txt`。
 
 ## 脚本
 
@@ -58,22 +62,51 @@ sh scripts/macos/test.sh
 | `scripts/macos/setup-signing.sh` | 首次准备或重新信任本机签名证书 |
 | `scripts/macos/icon.swift` | 生成应用图标，由打包脚本调用 |
 | `scripts/macos/test.sh` | 运行独立的 macOS 界面回归应用 |
+| `scripts/windows/icon.ps1` | 生成 `assets\jie.ico`（改图标后手动跑，结果提交） |
 | `scripts/windows/package.ps1` | 构建 Windows 便携包 |
 
 构建产物统一写入 `target/` 和 `dist/`，不提交到仓库。
 
+## 设计约定
+
+**资源是第一约束**：Windows 空闲私有内存 ≤ 15 MB、macOS 内存占用 ≤ 20 MB（待实测确认）；空闲 CPU 为 0；高分屏截图唤起 ≤ 100 ms、拖框 ≥ 60 fps；exe / app ≤ 3 MB。截图或取字结束后释放帧缓存，每张钉图内存不超过图片数据的两倍。录屏不常驻，1280×720 区域录制中多占 ≤ 20 MB、录多久都不涨，动图钉图 ≤ 2 帧图片数据。新窗口（托盘面板、钉图悬停条）用时才建、关了就销毁。
+
+**模块单向依赖**：`app` → `overlay` → `record` → `pin` → `anim`；`overlay`、`pin` → `toolbar`；`overlay` → `snap`（纯计算）；`app`、`settings_ui` → `hotkeys`。平台层不依赖 `settings`，`pin/bar.rs` 不认识钉图（按钮回调由钉图建窗口时给）。设置文件不做旧版兼容。
+
+**界面：新野兽派**（[设计稿](https://claude.ai/artifact/Q3iKzYeopupsZP8jBp6hT1)）。颜色、描边、实心阴影、圆角、尺寸都在 `src/ui.rs`，两端共用一份绘制代码，平台层不加新画法。界面里不出现蓝色，主题紫 `#9C44EC`，选区颜色可自定义（录屏边框、动图边框、录制圆点也用它）。栏上的按钮只放图标，鼠标移上去显示名字和快捷键；对话框里的按钮写字。平台差别只有：快捷键写法、系统字体、设置窗口标题栏和底部按钮顺序（Windows「确定 取消」，mac「取消 确定」）、托盘面板从任务栏往上弹还是从菜单栏往下弹。两处例外：设置窗口的边框和标题栏是系统的（Win11 用 DWM 刷成奶油色和墨色边框，Win10 保持白色）；钉图右键菜单在 mac 上是系统菜单。
+
+**图标「取景框」**（[预览](https://claude.ai/artifact/PWwgR63LbH73esTYzEUD8t) 的 A）：紫底、白色取景框、右下角柠檬黄方块，墨色粗描边和错位实心阴影。三处画的是同一份 100 × 100 网格坐标，改造型要一起改：Windows 的 `scripts/windows/icon.ps1`（exe、托盘、窗口图标都取自 `assets\jie.ico`）；mac 的 `scripts/macos/icon.swift`（紫底铺满整个图标，因为 macOS 26 起不是满版圆角方块的图标会被套进灰底方块）；mac 菜单栏的单色模板图（`src/plat/mac/app.rs` 的 `tray_icon`）。24 像素及以下白框加粗，不然发灰。
+
+**截图和录屏是同一个遮罩**，顶上「截图 | 录屏」模式条，`Tab` 切换；两个快捷键只决定打开时的模式。有标注时不能切到录屏（标注录不进去）。
+
+**录屏只出 GIF**，两端共用纯 Rust 的 `gif` crate：和上一帧比较只编码变化区域、不超过 256 色用精确调色板、超过用 NeuQuant；帧延迟按时间戳算，画面不变只加长上一帧。边录边写临时文件（Windows `%TEMP%\Jie\`，mac `NSTemporaryDirectory()/Jie/`），丢弃时删、启动时清空。复制到剪贴板的是文件（`CF_HDROP` / 文件 URL），因为没有通用的动图剪贴板格式。截屏：Windows 录制线程 `BitBlt`（不带 `CAPTUREBLT`，带了鼠标可能闪），鼠标自己画；mac 用 `SCStream`。
+
+**录屏界面不用「不被截屏」属性**（`WDA_EXCLUDEFROMCAPTURE` 会让窗口从所有截屏里消失，远程桌面、会议共享都看不到）：边框画在区域外面；控制条依次试区域下、上、右、左，都放不下才放进区域里，这时 Windows 每帧用放大镜 API 排除控制条、截它底下那一小块实时画面贴回去。mac 用 ScreenCaptureKit 只对本程序这一路排除；录屏界面放在状态栏层（25），不被 Dock 挡住；开始时可截窗口列表里还没有边框和控制条就每 50 ms 再要一次，最多 0.5 秒。
+
+**取字和翻译**都交给 OpenAI 兼容的模型服务（默认 DeepSeek），本机不识别。大图横着切成几条整宽的分开发（服务会把整张缩到约 1300×1300 像素）。原文语言只粗判中、英、日，用来在原文已经是目标语言时换一个目标、在卡片上标出语言；别的语言照设置的目标语言译。
+
+**暂不做**：MP4（GIF 滚动网页 30 秒约 23 MB、视频约 131 MB，要发长录屏时再做：Windows Media Foundation、mac AVAssetWriter，两端各约 M）、WebP/APNG、录制暂停、帧率和「录鼠标」设置、按 1 倍尺寸录、剪辑首尾、录制中标注、显示按键、声音、跟随窗口录制、吸附窗口里的控件。
+
+## 实测记录
+
+Windows 11 26200，3840×2160、150% 缩放，release 构建，15 fps，录屏幕中间 1280×720。CPU 是占一个核的比例。
+
+| 画面 | 实际帧率 | 30 秒文件 | 每帧编码 | 录屏 CPU | 录制中多占内存 |
+|---|---|---|---|---|---|
+| 静止界面 | 15.0 | 0.59 MB | 1.0 ms | 4% | 11.8 MB |
+| 滚动网页 | 15.0 | 22.9 MB | 18.5 ms | 32% | 15.5 MB |
+| 播放视频 | 14.9 | 130.8 MB | 39.5 ms | 66% | 21.9 MB（录屏本身约 19 MB） |
+
+5 个动图钉图：每个多占 4.9 MB（1.4 帧），一起播 CPU 33%。exe：1,954,304 字节（2026-11-09，换新图标后）。NeuQuant 在 4096 色渐变上平均误差 8.8、最大 30。
+
 ## 待验收
 
-UI 和两端功能已实现，以下人工验收仍需保留：
-
-- macOS：屏幕录制授权、Retina 与不同缩放的多屏、全屏应用上的截图、菜单栏、中文输入法，以及更新签名包后的授权和钥匙串访问。
+- 空闲内存、CPU：界面重设计后没复测。要用发布版、关掉平时开着的 Jie；项目目录里的 exe 以低完整性运行、加不上托盘，先拷到别处再跑。
 - Windows：在全新 Windows 10 22H2 / Windows 11 上运行便携包，回归托盘、快捷键、单实例、开机自启和保存对话框。
-- 两端：截图、标注、钉图、取字和翻译完整流程，粘贴到常用软件，以及资源占用复测。
-- 录屏（两端）：录屏快捷键、录制中再按快捷键停止；边框和控制条不出现在 GIF 里（区域贴屏幕边、全屏时也是），通过远程桌面（UU 远程、ToDesk 等）看也看得到；静止界面、滚动网页、播放视频三种画面各录 30 秒，记下实际帧率、CPU、录制中内存和文件大小；复制的 GIF 粘贴到微信、QQ、飞书、浏览器（GitHub Issue）、资源管理器/访达。macOS 的录屏截屏（`SCStream`）只在 Windows 上做过交叉编译检查，没有在真机上跑过；真机上要特别看：全屏录制时控制条压在 Dock 上看得到（状态栏层），点了马上开始时边框和控制条没录进 GIF。
-- 吸附：浏览器、VS Code、资源管理器、设置、微信这类窗口里，默认高亮主要面板（不是按钮、列表项这种小块），滚轮能一层层换到窗口和更小的面板、卡片、输入框、表格；高分屏和深色主题下也认得出。调算法时用 `cargo test dump_screen -- --ignored` 存几张真实屏幕，`cargo test real_screens -- --ignored --nocapture` 打印每个点的层次并画出默认那层（`target/test-tmp/snap/`）。
-- 录屏界面：倒计时、边框、控制条都不出现在 GIF 里；`cargo test record_flow -- --ignored` 截下真实屏幕存成 `target/test-tmp/record/scene-*.png`（它们没设不被截屏，截到的就是远程看到的样子），并检查 GIF 第一行不是边框颜色。框满整块屏幕的两种入口用发布版分别跑 `cargo test --release full_screen_flow -- --ignored --nocapture` 和 `cargo test --release full_screen_from_overlay -- --ignored --nocapture`（调试版编一帧 4K 要好几秒，2 秒只录得到一帧）：控制条压在任务栏上、截屏截得到；控制条底下垫的色块录到一半由绿变橙，GIF 第一帧那块是绿的、最后一帧是橙的（从遮罩来时比的是录完后的真实屏幕）。两个别放在同一个进程里连着跑：播放 4K 动图钉图很慢，第二个会卡到系统报「无响应」。
-- 录屏资源复测（PLAN.md §10）：`cargo test --release measure_ -- --ignored --nocapture --test-threads 1`，静止、滚动、视频三种画面各录 30 秒 1280×720，再同时开 5 个动图钉图；结果打印出来，也存在 `target/test-tmp/measure/*.txt`。
+- 托盘面板（两端）：右键托盘弹出、点外面和 `Esc` 关、方向键和 `Enter`；录制中显示「停止录屏」和时长；mac 上从菜单栏往下弹、能拿到键盘。各项没有单独的无障碍名字，读屏软件只读得出窗口名「Jie 菜单」。
+- 吸附：浏览器、VS Code、资源管理器、设置、微信这类窗口里，默认高亮主要面板，滚轮能一层层换；高分屏和深色主题下也认得出。
+- macOS（只在 Windows 上交叉编译检查过，没有真机跑过）：屏幕录制授权、Retina 与不同缩放的多屏、全屏应用上的截图、菜单栏、中文输入法、更新签名包后的授权和钥匙串访问；新图标（`icon.swift` 没在 mac 上跑过）在程序坞、访达和菜单栏里的样子；截图、标注、钉图、取字和翻译完整流程；录屏全流程，特别是全屏录制时控制条压在 Dock 上看得到、点了马上开始时边框和控制条没录进 GIF，复制的 GIF 粘贴到常用软件。
 
-资源目标：Windows 空闲私有内存 ≤ 15 MB、macOS 内存占用 ≤ 20 MB（待实测确认）；空闲 CPU 为 0；高分屏截图唤起 ≤ 100 ms、拖框 ≥ 60 fps；exe / app ≤ 3 MB。截图或取字结束后释放帧缓存，每张钉图内存不超过图片数据的两倍。
+## 已知限制
 
-已知限制：Windows HDR 截图可能发灰，不支持独占全屏游戏和 UAC 安全桌面；一次只能框选单个显示器。录屏只录屏幕上那块区域（窗口挪走或被挡住就录到别的），GIF 每帧最多 256 色，渐变和照片会有色带；没有声音。
+Windows HDR 截图可能发灰，不支持独占全屏游戏和 UAC 安全桌面；一次只能框选单个显示器。录屏只录屏幕上那块区域（窗口挪走或被挡住就录到别的），GIF 每帧最多 256 色，渐变和照片会有色带；没有声音。

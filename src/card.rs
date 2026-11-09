@@ -1,24 +1,27 @@
-//! 文字卡片：OCR 和翻译结果共用。置顶的弹出窗口，圆角交给系统（Win10 上是直角）；
+//! 文字卡片：OCR 和翻译结果共用，标题栏「识别 | 翻译」两个标签，同一张卡片里切换、就地翻译。
+//! 置顶的透明窗口，白底、2 墨色描边、6,6 实心阴影、圆角 12，标题栏奶油色；
 //! 正文自绘，自己做拖选、Ctrl+A、Ctrl+C、滚轮滚动，选中底色才能是浅紫。
 //! 尺寸按设计稿（DIP）乘卡片所在显示器的缩放比例。
 
 use crate::ocr::{self, Outcome};
-use crate::plat::{self, Button, Canvas, Cursor, Edge, Event, Face, Handler, Hit, Image, Key, Monitor, Point, Rect, Spec, Stroke, Text, Win};
+use crate::plat::{self, Button, Canvas, Color, Cursor, Edge, Event, Face, Handler, Hit, Image, Key, Monitor, Point, Rect, Spec, Text, Win};
 use crate::settings;
 use crate::toast::{self, Kind};
 use crate::translate;
-use crate::ui::{self, rectf, rgb, rgba};
+use crate::ui::{self, Hud, rectf, rgb, rgba};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 const T_SPIN: usize = 1;
-/// 标题栏「已复制」显示 1.5 秒
+/// 标题栏的复制按钮变成对勾 1.5 秒
 const T_COPIED: usize = 2;
+/// 标题栏按钮的工具提示：悬停 400ms 后出现
+const T_TIP: usize = 3;
 const FRAME_MS: u32 = 16;
 
-// 设计稿尺寸（DIP），第 3 版
+// 设计稿尺寸（DIP），第 4 版
 const WIDTH: f32 = 380.0;
-const HEAD: f32 = 44.0;
+const HEAD: f32 = 50.0;
 /// 底栏：按钮高 30 + 下边距 12，只在出错和没配服务时有
 const FOOT: f32 = 42.0;
 /// 正文最高 380，超出滚动
@@ -32,20 +35,15 @@ const PAD: f32 = 20.0;
 /// 离边这么近算拖边框改大小；拖出来的宽最小 300
 const EDGE: f32 = 6.0;
 const MIN_WIDTH: f32 = 300.0;
+/// 右下的实心阴影：窗口比卡片大出这一圈
+const SHADOW: f32 = 6.0;
 
-const TEXT: u32 = 0x1F1D23;
-const TEXT2: u32 = 0x6B6475;
-const TEXT3: u32 = 0xA9A3B2;
-const ACCENT: u32 = 0x9C44EC;
-/// 语言标签、「已复制」的深紫字
-const ACCENT_TEXT: u32 = 0x7A3CC0;
+const TEXT: u32 = ui::INK;
+const TEXT2: u32 = ui::MUTED;
+const TEXT3: u32 = ui::FAINT;
 const SELECTION: u32 = 0xE7D5FB;
 const ERR: u32 = 0xC62828;
-const ERR_BG: u32 = 0xFDF1F1;
-const BORDER: u32 = 0xE3DEEA;
-const LINE_COLOR: u32 = 0xECE8F1;
-/// 图标按钮悬停、按下的底色
-const HOVER: [u32; 3] = [0, 0xF1EDF5, 0xE8E2EF];
+const ERR_BG: u32 = 0xFFE9E6;
 
 const NO_SERVICE: [&str; 2] = [
     "还没有配置翻译服务",
@@ -62,7 +60,9 @@ static ORIG_OPEN: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy, PartialEq)]
 enum Btn {
-    /// 标题栏带字的「复制」：取字结果或译文
+    /// 标题栏的「识别」「翻译」两个标签（true 是翻译）
+    Tab(bool),
+    /// 标题栏的复制：取字结果或译文
     Copy,
     Close,
     /// 原文开关行：折叠或展开原文
@@ -124,9 +124,12 @@ struct Card {
     scale: f32,
     /// 所在显示器的工作区，卡片夹在里面
     work: Rect,
-    title: &'static str,
     /// 识别完接着翻译
     translate: bool,
+    /// 现在是「翻译」标签（否则「识别」）
+    tab_tr: bool,
+    /// 另一个标签的正文和它的附注、语言标签：切回去不用重来
+    other: Option<(Body, String, String)>,
     /// 翻译的语言标签「英 → 中」，空的不画
     pair: String,
     /// 标题栏附注「3 行 · 1.4 秒」
@@ -137,7 +140,7 @@ struct Card {
     content_h: f32,
     /// 原文开关行的顶边（像素，相对正文区，没减滚动量）
     row_y: f32,
-    /// 标题栏的「复制」刚点过，显示「已复制」
+    /// 标题栏的复制刚点过，显示对勾
     copied: bool,
     scroll: f32,
     /// 选中范围在哪一段；起点和光标是这一段的 UTF-16 下标
@@ -147,6 +150,8 @@ struct Card {
     selecting: bool,
     hot: Option<Btn>,
     down: Option<Btn>,
+    /// 显示提示的按钮
+    tip: Option<Btn>,
     angle: f32,
     /// 拖边框定下的宽、高（DIP）；没拖过的方向是 None：宽 380，高按内容
     user_w: Option<f32>,
@@ -157,8 +162,8 @@ struct Card {
 pub fn ocr(img: Image, anchor: Rect, mon: Monitor) {
     let s = settings::get();
     if !s.ocr_service().ready() {
-        create("取字", false, Body::NoService(true), anchor, mon);
-    } else if let Some(w) = create("取字", false, Body::Loading, anchor, mon) {
+        create(false, Body::NoService(true), anchor, mon);
+    } else if let Some(w) = create(false, Body::Loading, anchor, mon) {
         recognize(w, img);
     }
 }
@@ -167,10 +172,10 @@ pub fn ocr(img: Image, anchor: Rect, mon: Monitor) {
 pub fn translate(img: Image, anchor: Rect, mon: Monitor) {
     let s = settings::get();
     if !s.translate_service().ready() {
-        create("翻译", true, Body::NoService(false), anchor, mon);
+        create(true, Body::NoService(false), anchor, mon);
     } else if !s.ocr_service().ready() {
-        create("翻译", true, Body::NoService(true), anchor, mon);
-    } else if let Some(w) = create("翻译", true, Body::Loading, anchor, mon) {
+        create(true, Body::NoService(true), anchor, mon);
+    } else if let Some(w) = create(true, Body::Loading, anchor, mon) {
         recognize(w, img);
     }
 }
@@ -258,31 +263,9 @@ fn fit_edge(edge: Edge, mut r: Rect, min: (i32, i32), max: (i32, i32)) -> Rect {
     r
 }
 
-fn create(title: &'static str, translate: bool, body: Body, anchor: Rect, mon: Monitor) -> Option<Win> {
+fn create(translate: bool, body: Body, anchor: Rect, mon: Monitor) -> Option<Win> {
     let loading = matches!(body, Body::Loading);
-    let mut card = Card {
-        scale: mon.scale(),
-        work: mon.work,
-        title,
-        translate,
-        pair: String::new(),
-        meta: String::new(),
-        body,
-        blocks: Vec::new(),
-        content_h: 0.0,
-        row_y: 0.0,
-        copied: false,
-        scroll: 0.0,
-        sel_part: Part::Main,
-        anchor: 0,
-        caret: 0,
-        selecting: false,
-        hot: None,
-        down: None,
-        angle: 0.0,
-        user_w: None,
-        user_h: None,
-    };
+    let mut card = Card::new(mon.scale(), mon.work, translate, body);
     card.relayout();
     let (w, h) = (card.width(), card.height());
     let others: Vec<Point> = Win::all(plat::Kind::Card).iter().map(|c| c.rect()).map(|r| Point { x: r.left, y: r.top }).collect();
@@ -301,6 +284,34 @@ fn contains(r: &Rect, p: Point) -> bool {
 }
 
 impl Card {
+    fn new(scale: f32, work: Rect, translate: bool, body: Body) -> Card {
+        Card {
+            scale,
+            work,
+            translate,
+            tab_tr: translate,
+            other: None,
+            pair: String::new(),
+            meta: String::new(),
+            body,
+            blocks: Vec::new(),
+            content_h: 0.0,
+            row_y: 0.0,
+            copied: false,
+            scroll: 0.0,
+            sel_part: Part::Main,
+            anchor: 0,
+            caret: 0,
+            selecting: false,
+            hot: None,
+            down: None,
+            tip: None,
+            angle: 0.0,
+            user_w: None,
+            user_h: None,
+        }
+    }
+
     fn px(&self, dip: f32) -> f32 {
         dip * self.scale
     }
@@ -314,8 +325,18 @@ impl Card {
         self.user_w.unwrap_or(WIDTH)
     }
 
-    fn width(&self) -> i32 {
+    /// 卡片本体的宽（像素，不含阴影）
+    fn body_w(&self) -> i32 {
         self.pxi(self.w_dip())
+    }
+
+    fn shadow(&self) -> i32 {
+        self.pxi(SHADOW)
+    }
+
+    /// 窗口宽高：卡片本体加右下的阴影
+    fn width(&self) -> i32 {
+        self.body_w() + self.shadow()
     }
 
     fn head_h(&self) -> i32 {
@@ -341,12 +362,12 @@ impl Card {
     }
 
     fn height(&self) -> i32 {
-        self.head_h() + self.body_h() + self.foot_h()
+        self.head_h() + self.body_h() + self.foot_h() + self.shadow()
     }
 
     fn body_rect(&self) -> Rect {
         let top = self.head_h();
-        Rect { left: 0, top, right: self.width(), bottom: top + self.body_h() }
+        Rect { left: 0, top, right: self.body_w(), bottom: top + self.body_h() }
     }
 
     fn max_scroll(&self) -> f32 {
@@ -391,8 +412,8 @@ impl Card {
         self.scroll = self.scroll.clamp(0.0, self.max_scroll());
     }
 
-    /// 正文的各段文字、总高度、原文开关行的顶边。正文是界面字 15 号（Windows 上中日文由 DirectWrite 按 zh-CN 回落到微软雅黑）。
-    /// shortcut: 设计稿的段间距 4 没做，DirectWrite 没有段间距，要做得把每段拆成单独的排版、跨段选中再自己拼
+    /// 正文的各段文字、总高度、原文开关行的顶边。正文是界面字 15 号（Windows 上中日文由 DirectWrite 按 zh-CN 回落到微软雅黑），
+    /// 段与段之间不加间距（和设计稿一样只换行）。
     fn layout_body(&self) -> Option<(Vec<Block>, f32, f32)> {
         let s = self.scale;
         let wrap = self.px(self.w_dip() - 2.0 * PAD);
@@ -438,20 +459,18 @@ impl Card {
         Some((v, h, row_y))
     }
 
-    /// 标题栏「复制」按钮的字
-    fn copy_label(&self) -> &'static str {
-        if self.copied { "已复制" } else { "复制" }
-    }
-
     fn buttons(&self) -> Vec<(Btn, Rect)> {
-        let (w, b) = (self.width(), self.pxi(28.0));
+        let (w, b) = (self.body_w(), self.pxi(30.0));
         let top = (self.head_h() - b) / 2;
-        let close = Rect { left: w - self.pxi(8.0) - b, top, right: w - self.pxi(8.0), bottom: top + b };
-        // 「复制」：左 8 + 图标 16 + 空 5 + 字 + 右 10，离关闭 4
+        // 右边：复制、关闭，30 见方、间距 3、离右边 10
+        let close = Rect { left: w - self.pxi(10.0) - b, top, right: w - self.pxi(10.0), bottom: top + b };
+        let copy = Rect { left: close.left - self.pxi(3.0) - b, right: close.left - self.pxi(3.0), ..close };
         let tw = |label: &str| Text::new(Face::Ui, 13.0 * self.scale, false, label).map_or(0.0, |l| l.width());
-        let right = close.left - self.pxi(4.0);
-        let copy = Rect { left: right - (self.px(39.0) + tw(self.copy_label())).round() as i32, right, ..close };
-        let mut v = vec![(Btn::Copy, copy), (Btn::Close, close)];
+        // 左边：「识别 | 翻译」分段，外框离左边 10、高 34，里面两个标签高 28、字左右各 12、间距 2
+        let (tt, th) = ((self.head_h() - self.pxi(28.0)) / 2, self.pxi(28.0));
+        let t0 = Rect { left: self.pxi(13.0), top: tt, right: self.pxi(13.0) + (tw("识别") + self.px(24.0)).round() as i32, bottom: tt + th };
+        let t1 = Rect { left: t0.right + self.pxi(2.0), right: t0.right + self.pxi(2.0) + (tw("翻译") + self.px(24.0)).round() as i32, ..t0 };
+        let mut v = vec![(Btn::Tab(false), t0), (Btn::Tab(true), t1), (Btn::Copy, copy), (Btn::Close, close)];
         if let Body::Translate(tr) = &self.body {
             // 原文开关行跟着正文滚动：左 12 起整条是开关（高 28），展开时右边多一个 24 见方的复制原文（离右边 8）
             let oy = self.body_rect().top + (self.row_y - self.scroll).round() as i32;
@@ -479,8 +498,23 @@ impl Card {
         v
     }
 
+    /// 能点的按钮：复制要有内容；标签只能点另一个，并且要已经有识别出的文字（或者另一个标签有内容）
     fn enabled(&self, b: Btn) -> bool {
-        b != Btn::Copy || self.part_text(Part::Main).is_some()
+        match b {
+            Btn::Copy => self.part_text(Part::Main).is_some(),
+            Btn::Tab(t) => t != self.tab_tr && (matches!(self.body, Body::Text(_) | Body::Translate(_)) || self.other.is_some()),
+            _ => true,
+        }
+    }
+
+    /// 标题栏按钮的提示：(名字, 快捷键)；标签没有提示
+    fn tip_text(&self, b: Btn) -> Option<(&'static str, &'static str)> {
+        Some(match b {
+            Btn::Copy => (if self.tab_tr { "复制译文" } else { "复制全文" }, ""),
+            Btn::Close => ("关闭", "Esc"),
+            Btn::CopyOrig => ("复制原文", ""),
+            _ => return None,
+        })
     }
 
     fn btn_at(&self, p: Point) -> Option<Btn> {
@@ -547,16 +581,17 @@ impl Card {
     /// 拖边框：系统给的新窗口夹到最小、最大之间；拖了哪个方向就定下哪个方向的大小，
     /// 之后内容变了也不再自动改；正文按新宽度重新折行
     fn drag_size(&mut self, edge: Edge, r: Rect) -> Rect {
-        let (w, m) = (self.work, self.pxi(8.0));
-        let min = (self.pxi(MIN_WIDTH), self.pxi(HEAD + FOOT + 3.0 * LINE));
+        // 窗口连阴影，记下的宽高不连
+        let (w, m, sh) = (self.work, self.pxi(8.0), self.shadow());
+        let min = (self.pxi(MIN_WIDTH) + sh, self.pxi(HEAD + FOOT + 3.0 * LINE) + sh);
         let max = (w.right - w.left - 2 * m, w.bottom - w.top - 2 * m);
         let mut r = fit_edge(edge, r, min, max);
         let (left, right, top, bottom) = edge.sides();
         if left || right {
-            self.user_w = Some((r.right - r.left) as f32 / self.scale);
+            self.user_w = Some((r.right - r.left - sh) as f32 / self.scale);
         }
         if top || bottom {
-            self.user_h = Some((r.bottom - r.top) as f32 / self.scale);
+            self.user_h = Some((r.bottom - r.top - sh) as f32 / self.scale);
         } else {
             // 只拖了宽：高度还按内容，跟着重新折行变
             self.relayout();
@@ -637,16 +672,55 @@ impl Card {
         w.timer(T_SPIN, FRAME_MS);
     }
 
+    /// 译文到了；翻译中切到了「识别」标签的话，记到另一个标签上
     fn translated(&mut self, w: Win, out: Translated) {
-        let Body::Translate(tr) = &mut self.body else { return };
+        let (tr, meta) = match (&mut self.body, &mut self.other) {
+            (Body::Translate(tr), _) => (tr, &mut self.meta),
+            (_, Some((Body::Translate(tr), meta, _))) => (tr, meta),
+            _ => return,
+        };
         tr.state = match out {
             Ok((t, took)) => {
-                self.meta = took;
+                *meta = took;
                 TrState::Done(t)
             }
             Err(e) => TrState::Failed(e),
         };
         w.kill_timer(T_SPIN);
+        self.refit(w);
+    }
+
+    /// 切到「识别」（`tr` 为 false）或「翻译」标签：另一个标签已经有内容就换回来，没有就拿识别出的文字现做（翻译要请求一次）
+    fn switch_tab(&mut self, w: Win, tr: bool) {
+        if tr == self.tab_tr {
+            return;
+        }
+        let cur = (std::mem::replace(&mut self.body, Body::Loading), std::mem::take(&mut self.meta), std::mem::take(&mut self.pair));
+        let text = match &cur.0 {
+            Body::Text(t) => Some((t.clone(), t.lines().count().max(1))),
+            Body::Translate(t) => Some((t.orig.clone(), t.lines)),
+            _ => None,
+        };
+        (self.tab_tr, self.copied, self.sel_part, self.anchor, self.caret, self.scroll) = (tr, false, Part::Main, 0, 0, 0.0);
+        // 「没配置」的那页不留着：可能刚去设置里配好
+        match (self.other.take().filter(|(b, ..)| !matches!(b, Body::NoService(_))), text) {
+            (Some((b, m, p)), _) => (self.body, self.meta, self.pair) = (b, m, p),
+            (None, Some((orig, lines))) if tr => {
+                if settings::get().translate_service().ready() {
+                    let (src, open) = (translate::detect(&orig), ORIG_OPEN.load(Ordering::Relaxed));
+                    self.body = Body::Translate(Tr { orig, src, lines, open, state: TrState::Busy });
+                    self.request(w);
+                } else {
+                    self.body = Body::NoService(false);
+                }
+            }
+            (None, Some((orig, lines))) => {
+                self.meta = format!("{lines} 行");
+                self.body = Body::Text(orig);
+            }
+            (None, None) => {}
+        }
+        self.other = Some(cur);
         self.refit(w);
     }
 
@@ -657,50 +731,85 @@ impl Card {
         self.refit(w);
     }
 
+    /// 画卡片本体（w × h 不含阴影，阴影画在外面）：奶油色标题栏、白色正文，外面一圈 2 墨色描边
     fn draw(&self, c: &Canvas, w: f32, h: f32) {
         let s = self.scale;
-        c.clear(rgb(0xFFFFFF));
+        let (lw, head, rad) = (ui::line_w(s), self.head_h() as f32, 12.0 * s);
+        ui::block(c, rectf(0.0, 0.0, w, h), 12.0, SHADOW, ui::CREAM, s);
+        // 标题栏下面换成白底（下边两个圆角跟着外框），再画标题栏下的分隔线
+        c.fill_round(rectf(lw, head, w - lw, h - lw), (rad - lw).max(0.0), rgb(ui::SURF));
+        c.fill_rect(rectf(lw, head, w - lw, (head + rad).min(h - lw)), rgb(ui::SURF));
+        c.fill_rect(rectf(lw, head - lw, w - lw, head), rgb(ui::INK));
         let buttons = self.buttons();
         let _ = (|| -> Option<()> {
-            // 标题栏：标题 14/600；翻译加语言标签（高 20、圆角 10、字左右 7）；附注 12 浅灰；右边「复制」和关闭
-            let head = self.head_h() as f32;
-            let title = Text::new(Face::Ui, 14.0 * s, true, self.title)?;
-            c.text(&title, 18.0 * s, (head - title.height()) / 2.0, rgb(TEXT));
-            let mut x = 18.0 * s + title.width() + 8.0 * s;
+            let find = |b: Btn| buttons.iter().find(|(x, _)| *x == b).map(|(_, r)| *r);
+            let (t0, t1) = (find(Btn::Tab(false))?, find(Btn::Tab(true))?);
+            // 「识别 | 翻译」分段：白底、墨色描边，当前标签墨底白字
+            let p = self.px(3.0).round();
+            let seg = rectf(t0.left as f32 - p, t0.top as f32 - p, t1.right as f32 + p, t0.bottom as f32 + p);
+            c.fill_round(seg, 7.0 * s, rgb(ui::SURF));
+            c.stroke_round(rectf(seg.left + lw / 2.0, seg.top + lw / 2.0, seg.right - lw / 2.0, seg.bottom - lw / 2.0), 7.0 * s - lw / 2.0, rgb(ui::INK), lw);
+            for (tab, r, name) in [(false, t0, "识别"), (true, t1, "翻译")] {
+                let b = Btn::Tab(tab);
+                let rf = rectf(r.left as f32, r.top as f32, r.right as f32, r.bottom as f32);
+                let fg = if tab == self.tab_tr {
+                    c.fill_round(rf, 5.0 * s, rgb(ui::INK));
+                    0xFFFFFF
+                } else if !self.enabled(b) {
+                    TEXT3
+                } else if self.hot == Some(b) {
+                    c.fill_round(rf, 5.0 * s, rgb(if self.down == Some(b) { ui::PRESS } else { ui::HOVER }));
+                    TEXT
+                } else {
+                    TEXT2
+                };
+                let l = Text::new(Face::Ui, 13.0 * s, true, name)?;
+                c.text(&l, (rf.left + rf.right - l.width()) / 2.0, (rf.top + rf.bottom - l.height()) / 2.0, rgb(fg));
+            }
+            let mut x = seg.right + 8.0 * s;
+            // 翻译的语言标签：柠檬黄底、墨色描边、高 22
             if !self.pair.is_empty() {
-                let l = Text::new(Face::Ui, 12.0 * s, false, &self.pair)?;
-                let cw = l.width() + 14.0 * s;
-                c.fill_round(rectf(x, head / 2.0 - 10.0 * s, x + cw, head / 2.0 + 10.0 * s), 10.0 * s, rgb(0xF4EEFB));
-                c.text(&l, x + 7.0 * s, (head - l.height()) / 2.0, rgb(ACCENT_TEXT));
-                x += cw + 6.0 * s;
+                let l = Text::new(Face::Ui, 12.0 * s, true, &self.pair)?;
+                let cw = l.width() + 16.0 * s;
+                let r = rectf(x, head / 2.0 - 11.0 * s, x + cw, head / 2.0 + 11.0 * s);
+                c.fill_round(r, 6.0 * s, rgb(ui::PICK));
+                c.stroke_round(rectf(r.left + lw / 2.0, r.top + lw / 2.0, r.right - lw / 2.0, r.bottom - lw / 2.0), 6.0 * s - lw / 2.0, rgb(ui::INK), lw);
+                c.text(&l, x + 8.0 * s, (head - l.height()) / 2.0, rgb(TEXT));
+                x += cw + 8.0 * s;
             }
             if !self.meta.is_empty() {
                 let meta = Text::tabular(Face::Ui, 12.0 * s, false, &self.meta)?;
-                meta.truncate(buttons[0].1.left as f32 - 8.0 * s - x);
-                c.text(&meta, x, (head - meta.height()) / 2.0, rgb(TEXT3));
+                meta.truncate(find(Btn::Copy)?.left as f32 - 8.0 * s - x);
+                c.text(&meta, x, (head - meta.height()) / 2.0, rgb(TEXT2));
             }
             // 正文裁在自己的区域里，跟着滚动的原文开关行也是
             let body = self.body_rect();
-            c.push_clip(rectf(0.0, body.top as f32, w, body.bottom as f32));
+            c.push_clip(rectf(lw, body.top as f32, w - lw, body.bottom as f32));
             let r = self.draw_body(c, w, &buttons);
             c.pop_clip();
             r?;
             for (b, r) in &buttons {
-                if !matches!(b, Btn::Toggle | Btn::CopyOrig) {
+                if !matches!(b, Btn::Toggle | Btn::CopyOrig | Btn::Tab(_)) {
                     self.draw_button(c, *b, r)?;
                 }
             }
+            // 提示：按钮正下方，夹在卡片里
+            if let Some(b) = self.tip
+                && let (Some((name, key)), Some(r)) = (self.tip_text(b), find(b))
+            {
+                let parts: &[(&str, u32)] = if key.is_empty() { &[(name, 0xFFFFFF)] } else { &[(name, 0xFFFFFF), (key, ui::HUD_TEXT2)] };
+                let hud = Hud::new(parts, s)?;
+                let x = ((r.left + r.right - hud.w) / 2).clamp(lw as i32, (w as i32 - lw as i32 - hud.w).max(lw as i32));
+                hud.draw(c, x, r.bottom + self.pxi(6.0));
+            }
             Some(())
         })();
-        // 1px 外框；Win11 上系统会在同一个位置再画一圈同色的圆角边
-        let lw = s.round().max(1.0);
-        c.stroke_rect(rectf(lw / 2.0, lw / 2.0, w - lw / 2.0, h - lw / 2.0), rgb(BORDER), lw, Stroke::Plain);
     }
 
     /// 转圈 + 一行灰字，转圈左上角在 (20, y + 8)
     fn draw_busy(&self, c: &Canvas, y: f32, text: &str) -> Option<()> {
         let s = self.scale;
-        ui::spinner(c, PAD * s, y + 8.0 * s, s, self.angle, rgb(0xEBDDFB), rgb(ACCENT));
+        ui::spinner(c, PAD * s, y + 8.0 * s, s, self.angle, rgb(0xEBDDFB), rgb(ui::ACCENT));
         let l = Text::new(Face::Ui, 13.0 * s, false, text)?;
         c.text(&l, 46.0 * s, y + 16.0 * s - l.height() / 2.0, rgb(TEXT2));
         Some(())
@@ -720,21 +829,22 @@ impl Card {
                     TrState::Failed(_) => {
                         if let Some(b) = self.blocks.iter().find(|b| b.part == Part::Plain) {
                             let (y0, y1) = (oy + b.y - 10.0 * s, oy + b.y + b.layout.height() + 10.0 * s);
-                            c.fill_round(rectf(16.0 * s, y0, w - 16.0 * s, y1), 6.0 * s, rgb(ERR_BG));
+                            let lw = ui::line_w(s);
+                            c.fill_round(rectf(16.0 * s, y0, w - 16.0 * s, y1), 8.0 * s, rgb(ERR_BG));
+                            c.stroke_round(rectf(16.0 * s + lw / 2.0, y0 + lw / 2.0, w - 16.0 * s - lw / 2.0, y1 - lw / 2.0), 8.0 * s - lw / 2.0, rgb(ui::INK), lw);
                             ui::icon(c, "warn", 28.0 * s, oy + b.y + (13.0 * 1.5 - 16.0) / 2.0 * s, 16.0 * s, rgb(ERR));
                         }
                     }
                     TrState::Done(_) => {}
                 }
-                // 开关行：上面一条分隔线；「> 原文 · English · 3 行」，悬停时浅底、字变深
-                let ry = oy + self.row_y;
-                c.fill_rect(rectf(0.0, ry, w, ry + s.round().max(1.0)), rgb(LINE_COLOR));
+                // 开关行：白底墨色描边的一条「> 原文 · English · 3 行」，悬停浅紫、字变深
                 if let Some((_, r)) = buttons.iter().find(|(b, _)| *b == Btn::Toggle) {
                     let hot = self.hot == Some(Btn::Toggle);
                     let (l, t, rr, bb) = (r.left as f32, r.top as f32, r.right as f32, r.bottom as f32);
-                    if hot {
-                        c.fill_round(rectf(l, t, rr, bb), 6.0 * s, rgb(HOVER[if self.down == Some(Btn::Toggle) { 2 } else { 1 }]));
-                    }
+                    let fill = if !hot { ui::SURF } else if self.down == Some(Btn::Toggle) { ui::PRESS } else { ui::HOVER };
+                    let lw = ui::line_w(s);
+                    c.fill_round(rectf(l, t, rr, bb), 7.0 * s, rgb(fill));
+                    c.stroke_round(rectf(l + lw / 2.0, t + lw / 2.0, rr - lw / 2.0, bb - lw / 2.0), 7.0 * s - lw / 2.0, rgb(ui::INK), lw);
                     let col = rgb(if hot { TEXT } else { TEXT2 });
                     ui::icon(c, if tr.open { "chev_down" } else { "chev" }, l + 6.0 * s, (t + bb) / 2.0 - 8.0 * s, 16.0 * s, col);
                     let label = match tr.src {
@@ -778,47 +888,25 @@ impl Card {
         Some(())
     }
 
-    /// 标题栏的「复制」（图标 + 字）和图标按钮；底栏的文字按钮（主按钮紫底白字，其余白底灰边），圆角都是 6
+    /// 标题栏的图标按钮（复制、关闭）、原文旁的复制原文；底栏的文字按钮（主按钮紫底白字，其余白底），样子和操作栏一样
     fn draw_button(&self, c: &Canvas, b: Btn, r: &Rect) -> Option<()> {
         let s = self.scale;
-        let (l, t, rr, bb) = (r.left as f32, r.top as f32, r.right as f32, r.bottom as f32);
-        let on = self.enabled(b);
-        let state = match (on && self.hot == Some(b), self.down == Some(b)) {
-            (true, true) => 2,
-            (true, false) => 1,
-            _ => 0,
-        };
-        let text = |t: &str| Text::new(Face::Ui, 13.0 * s, false, t);
+        let rf = rectf(r.left as f32, r.top as f32, r.right as f32, r.bottom as f32);
+        let st = ui::state(self.enabled(b), false, self.hot == Some(b), self.down == Some(b));
         if let Some(&(_, label, primary)) = self.foot_buttons().iter().find(|f| f.0 == b) {
-            let (bg, fg) = if primary { ([ACCENT, 0xA95CF0, 0x8733D4][state], 0xFFFFFF) } else { ([0xFFFFFF, 0xF7F4FA, 0xEFEAF4][state], TEXT) };
-            c.fill_round(rectf(l, t, rr, bb), 6.0 * s, rgb(bg));
-            if !primary {
-                // 整像素的灰边画在像素中心才不糊
-                let (lw, hw) = (s.round().max(1.0), s.round().max(1.0) / 2.0);
-                c.stroke_round(rectf(l + hw, t + hw, rr - hw, bb - hw), 6.0 * s, rgb(0xDCD6E3), lw);
-            }
-            let label = text(label)?;
-            c.text(&label, (l + rr - label.width()) / 2.0, (t + bb - label.height()) / 2.0, rgb(fg));
+            let face = if primary { ui::primary(c, rf, st, s) } else { ui::secondary(c, rf, st, s) };
+            let label = Text::new(Face::Ui, 13.0 * s, true, label)?;
+            c.text(&label, (face.left + face.right - label.width()) / 2.0, (face.top + face.bottom - label.height()) / 2.0, rgb(if primary { 0xFFFFFF } else { TEXT }));
             return Some(());
         }
-        if state > 0 {
-            c.fill_round(rectf(l, t, rr, bb), 6.0 * s, rgb(HOVER[state]));
-        }
-        let fg = rgb(match (on, self.copied && b == Btn::Copy, state > 0) {
-            (false, ..) => TEXT3,
-            (true, true, _) => ACCENT_TEXT,
-            (true, false, true) => TEXT,
-            _ => TEXT2,
-        });
-        let iy = (t + bb) / 2.0 - 8.0 * s;
-        match b {
-            Btn::Copy => {
-                ui::icon(c, if self.copied { "check" } else { "copy" }, l + 8.0 * s, iy, 16.0 * s, fg);
-                let label = text(self.copy_label())?;
-                c.text(&label, l + 29.0 * s, (t + bb - label.height()) / 2.0, fg);
-            }
-            _ => ui::icon(c, if b == Btn::Close { "close" } else { "copy" }, (l + rr) / 2.0 - 8.0 * s, iy, 16.0 * s, fg),
-        }
+        let (dy, fg) = ui::button_bg(c, rf, st, s);
+        let name = match b {
+            Btn::Close => "close",
+            Btn::Copy if self.copied => "check",
+            _ => "copy",
+        };
+        let size = if b == Btn::CopyOrig { 16.0 } else { 18.0 } * s;
+        ui::icon(c, name, (rf.left + rf.right - size) / 2.0, (rf.top + rf.bottom - size) / 2.0 + dy, size, fg);
         Some(())
     }
 }
@@ -827,6 +915,8 @@ impl Handler for Card {
     fn event(&mut self, w: Win, e: Event) {
         match e {
             Event::Down { p, button: Button::Left, mods, .. } => {
+                self.tip = None;
+                w.kill_timer(T_TIP);
                 if let Some(b) = self.btn_at(p) {
                     self.down = Some(b);
                 } else if let Some(part) = self.in_text(p) {
@@ -845,7 +935,12 @@ impl Handler for Card {
             Event::Move { p, .. } => {
                 let hot = self.btn_at(p);
                 if hot != self.hot {
-                    self.hot = hot;
+                    // 换了按钮：提示先收起，停 400ms 再出来
+                    (self.hot, self.tip) = (hot, None);
+                    w.kill_timer(T_TIP);
+                    if hot.is_some_and(|b| self.tip_text(b).is_some()) && self.down.is_none() {
+                        w.timer(T_TIP, 400);
+                    }
                     w.invalidate_all();
                 }
                 if self.selecting {
@@ -864,6 +959,7 @@ impl Handler for Card {
                 }
             }
             Event::Leave => {
+                self.tip = None;
                 if self.hot.take().is_some() {
                     w.invalidate_all();
                 }
@@ -873,6 +969,7 @@ impl Handler for Card {
                 self.selecting = false;
                 w.invalidate_all();
                 match clicked {
+                    Some(Btn::Tab(t)) => self.switch_tab(w, t),
                     Some(Btn::Close) => w.close(),
                     Some(Btn::Copy) => {
                         if self.copy(w, self.part_text(Part::Main).unwrap_or_default(), false) {
@@ -886,10 +983,7 @@ impl Handler for Card {
                         self.request(w);
                         self.refit(w);
                     }
-                    Some(Btn::Settings) => {
-                        let ocr = matches!(self.body, Body::NoService(true));
-                        Win::later(move || crate::settings_ui::show_service(ocr));
-                    }
+                    Some(Btn::Settings) => Win::later(crate::settings_ui::show_service),
                     None => {}
                 }
             }
@@ -916,6 +1010,11 @@ impl Handler for Card {
                 self.angle = (self.angle + 360.0 * FRAME_MS as f32 / 800.0) % 360.0;
                 w.invalidate(self.body_rect());
             }
+            Event::Timer(T_TIP) => {
+                w.kill_timer(T_TIP);
+                self.tip = self.hot;
+                w.invalidate_all();
+            }
             Event::Timer(T_COPIED) => {
                 w.kill_timer(T_COPIED);
                 self.copied = false;
@@ -934,7 +1033,8 @@ impl Handler for Card {
     }
 
     fn paint(&mut self, _w: Win, c: &Canvas) {
-        self.draw(c, self.width() as f32, self.height() as f32);
+        c.clear(Color::default());
+        self.draw(c, self.body_w() as f32, (self.height() - self.shadow()) as f32);
     }
 
     fn cursor(&mut self, _w: Win, p: Point) -> Cursor {
@@ -943,7 +1043,8 @@ impl Handler for Card {
 
     /// 离边 6 以内拖边框改大小；标题栏空白处按住拖动
     fn hit(&mut self, _w: Win, p: Point) -> Hit {
-        if let Some(e) = edge_at(p, self.width(), self.height(), self.pxi(EDGE)) {
+        // 按卡片本体算边；右边、下边的阴影也算在边上
+        if let Some(e) = edge_at(p, self.body_w(), self.height() - self.shadow(), self.pxi(EDGE)) {
             return Hit::Edge(e);
         }
         if p.y >= 0 && p.y < self.head_h() && self.btn_at(p).is_none() { Hit::Caption } else { Hit::Client }
@@ -1034,7 +1135,7 @@ mod tests {
     fn resize_card() {
         let mon = plat::monitor_at(Point { x: 0, y: 0 });
         let anchor = Rect { left: mon.work.left + 100, top: mon.work.top + 100, right: mon.work.left + 300, bottom: mon.work.top + 200 };
-        let w = create("取字", false, Body::Loading, anchor, mon).unwrap();
+        let w = create(false, Body::Loading, anchor, mon).unwrap();
         let c = w.peek::<Card>();
         // 右边往右拉 dx，或者下边往下拉 dy
         let drag = |edge: Edge, dx: i32, dy: i32| {
@@ -1051,7 +1152,7 @@ mod tests {
         assert_eq!(size(w), (c.width(), c.height()));
         // 往上拖到比最小还矮：停在标题栏 + 底栏 + 3 行
         drag(Edge::Bottom, 0, -2000);
-        assert_eq!(size(w).1, c.pxi(HEAD + FOOT + 3.0 * LINE));
+        assert_eq!(size(w).1, c.pxi(HEAD + FOOT + 3.0 * LINE) + c.shadow());
         drag(Edge::Bottom, 0, 200);
         let fixed = size(w);
         assert!(c.user_h.is_some());
@@ -1068,29 +1169,7 @@ mod tests {
     #[test]
     fn orig_row_sticks_to_bottom() {
         let tr = |open: bool| Body::Translate(Tr { orig: "Hello world".into(), src: None, lines: 1, open, state: TrState::Done("你好世界".into()) });
-        let mut c = Card {
-            scale: 1.0,
-            work: Rect { left: 0, top: 0, right: 1920, bottom: 1080 },
-            title: "翻译",
-            translate: true,
-            pair: String::new(),
-            meta: String::new(),
-            body: tr(false),
-            blocks: Vec::new(),
-            content_h: 0.0,
-            row_y: 0.0,
-            copied: false,
-            scroll: 0.0,
-            sel_part: Part::Main,
-            anchor: 0,
-            caret: 0,
-            selecting: false,
-            hot: None,
-            down: None,
-            angle: 0.0,
-            user_w: None,
-            user_h: None,
-        };
+        let mut c = Card::new(1.0, Rect { left: 0, top: 0, right: 1920, bottom: 1080 }, true, tr(false));
         c.relayout();
         let natural = c.row_y;
         // 没拖过高度：卡片跟着内容，开关行接在译文后面
@@ -1164,7 +1243,12 @@ mod tests {
         let snap = |w: Win, name: &str| {
             let c = w.peek::<Card>();
             let bmp = Bitmap::new(c.width(), c.height()).unwrap();
-            c.draw(&Canvas::new(&bmp, bmp.full(), false), bmp.w as f32, bmp.h as f32);
+            // 和窗口里一样：本体不含阴影，画在灰底上看得出阴影。画完（canvas 释放）才能读像素
+            {
+                let canvas = Canvas::new(&bmp, bmp.full(), false);
+                canvas.clear(rgb(0x808080));
+                c.draw(&canvas, c.body_w() as f32, (c.height() - c.shadow()) as f32);
+            }
             std::fs::write(dir.join(name), plat::encode(&bmp.crop(&bmp.full()), false).unwrap()).unwrap();
         };
         // 识别服务回的文字

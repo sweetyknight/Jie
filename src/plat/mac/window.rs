@@ -561,12 +561,15 @@ impl Win {
         };
         w.setContentView(Some(&view));
         w.makeFirstResponder(Some(&*view));
-        w.setHasShadow(matches!(spec.kind, Kind::Pin | Kind::Card));
+        // 文字卡片自己画实心阴影
+        w.setHasShadow(spec.kind == Kind::Pin);
         w.setLevel(match spec.kind {
             Kind::Overlay => objc2_app_kit::NSScreenSaverWindowLevel,
             Kind::Settings => objc2_app_kit::NSNormalWindowLevel,
             // 录屏的边框、倒计时、控制条会压在 Dock、菜单栏那条上（全屏录制时控制条放在 Dock 上）：浮动层在 Dock 下面会被挡住
+            // 托盘面板贴着菜单栏往下弹，和系统菜单同一层
             Kind::RecFrame | Kind::RecBar => objc2_app_kit::NSStatusWindowLevel,
+            Kind::Tray => objc2_app_kit::NSPopUpMenuWindowLevel,
             _ => objc2_app_kit::NSFloatingWindowLevel,
         });
         w.setAnimationBehavior(NSWindowAnimationBehavior::None);
@@ -575,9 +578,15 @@ impl Win {
             w.setCollectionBehavior(NSWindowCollectionBehavior::CanJoinAllSpaces | NSWindowCollectionBehavior::FullScreenAuxiliary);
         }
         // AppKit rounds frames to whole points; odd-sized Retina pins leave spare backing pixels.
-        w.setOpaque(!matches!(spec.kind, Kind::Pin | Kind::PinBar | Kind::Toast | Kind::RecFrame | Kind::RecBar));
-        if matches!(spec.kind, Kind::Pin | Kind::PinBar | Kind::Toast | Kind::RecFrame | Kind::RecBar) {
+        let clear = matches!(spec.kind, Kind::Pin | Kind::PinBar | Kind::Toast | Kind::RecFrame | Kind::RecBar | Kind::Card | Kind::Tray);
+        w.setOpaque(!clear);
+        if clear {
             w.setBackgroundColor(Some(&NSColor::clearColor()));
+        }
+        // 设置窗口：标题栏透明，露出和内容一样的奶油底，只留红黄绿
+        if spec.kind == Kind::Settings {
+            w.setTitlebarAppearsTransparent(true);
+            w.setBackgroundColor(Some(&NSColor::colorWithSRGBRed_green_blue_alpha(1.0, 244.0 / 255.0, 220.0 / 255.0, 1.0)));
         }
         if matches!(spec.kind, Kind::Toast | Kind::RecFrame) {
             w.setIgnoresMouseEvents(true);

@@ -1,7 +1,115 @@
-//! 自绘界面的公用件：颜色、深色浮层（尺寸读数、工具提示）、自绘图标、加载转圈。只用 plat 的绘制接口。
+//! 自绘界面的公用件：新野兽派的颜色和画法（实心阴影块、按钮各状态、主按钮）、浮层（工具提示、读数）、自绘图标、加载转圈。
+//! 只用 plat 的绘制接口，两端画出来一样。
 
 use crate::plat::{Affine, Canvas, Color, Face, Path, PathBuilder, Rect, RectF, Stroke, Text};
 use std::cell::RefCell;
+
+// ---- 新野兽派令牌。不出现蓝色 ----
+
+/// 墨色：描边、实心阴影、正文字
+pub const INK: u32 = 0x151317;
+/// 栏、卡片、面板的底
+pub const SURF: u32 = 0xFFFFFF;
+/// 奶油：设置窗口、卡片标题栏
+pub const CREAM: u32 = 0xFFF4DC;
+/// 主题紫：主按钮、开关
+pub const ACCENT: u32 = 0x9C44EC;
+pub const ACCENT_HOVER: u32 = 0xA95CF0;
+pub const ACCENT_PRESS: u32 = 0x8733D4;
+/// 柠檬黄：当前项（当前工具、导航当前页）、读数
+pub const PICK: u32 = 0xFFD43B;
+pub const HOVER: u32 = 0xF1E5FF;
+pub const PRESS: u32 = 0xE2CCFA;
+/// 次要字、不可用
+pub const MUTED: u32 = 0x57505F;
+pub const FAINT: u32 = 0xA9A1B0;
+/// 胶囊里的状态方块
+pub const OK: u32 = 0x8FE36B;
+pub const ERR: u32 = 0xFF6B5E;
+
+/// 描边宽：2 DIP 取整到物理像素，边才不糊
+pub fn line_w(s: f32) -> f32 {
+    (2.0 * s).round().max(1.0)
+}
+
+/// 新野兽派的块：右下错开 `shadow` DIP 的墨色实心阴影，`fill` 底，里面贴边一圈 2 DIP 墨色描边。
+/// `r` 不含阴影，阴影画在 r 外面；`radius` 是 DIP
+pub fn block(c: &Canvas, r: RectF, radius: f32, shadow: f32, fill: u32, s: f32) {
+    let (rad, d) = (radius * s, (shadow * s).round());
+    if d > 0.0 {
+        c.fill_round(rectf(r.left + d, r.top + d, r.right + d, r.bottom + d), rad, rgb(INK));
+    }
+    c.fill_round(r, rad, rgb(fill));
+    let lw = line_w(s);
+    let h = lw / 2.0;
+    c.stroke_round(rectf(r.left + h, r.top + h, r.right - h, r.bottom - h), (rad - h).max(0.0), rgb(INK), lw);
+}
+
+/// 按钮现在的样子
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum State {
+    Normal,
+    Hover,
+    Press,
+    /// 当前项：当前工具、选中的粗细、带角标的按钮
+    On,
+    Off,
+}
+
+/// `hot`：鼠标在上面；`down`：按住的是它（按住后挪开就回到常态）
+pub fn state(enabled: bool, on: bool, hot: bool, down: bool) -> State {
+    match (enabled, on, hot, down) {
+        (false, ..) => State::Off,
+        (_, true, ..) => State::On,
+        (_, _, true, true) => State::Press,
+        (_, _, true, false) => State::Hover,
+        _ => State::Normal,
+    }
+}
+
+/// 普通按钮的底（圆角 7）：当前项柠檬黄加墨色内描边，悬停浅紫，按下深一点。返回内容该往下挪多少（按下沉 1）和前景色
+pub fn button_bg(c: &Canvas, r: RectF, st: State, s: f32) -> (f32, Color) {
+    let rad = 7.0 * s;
+    match st {
+        State::On => {
+            c.fill_round(r, rad, rgb(PICK));
+            let lw = line_w(s);
+            let h = lw / 2.0;
+            c.stroke_round(rectf(r.left + h, r.top + h, r.right - h, r.bottom - h), rad - h, rgb(INK), lw);
+        }
+        State::Hover => c.fill_round(r, rad, rgb(HOVER)),
+        State::Press => c.fill_round(r, rad, rgb(PRESS)),
+        State::Normal | State::Off => {}
+    }
+    let dy = if st == State::Press { s.round() } else { 0.0 };
+    (dy, rgb(if st == State::Off { FAINT } else { INK }))
+}
+
+/// 主按钮：紫底、墨色描边、2,2 实心阴影；悬停变亮、往左上抬 1、阴影 3，按下变深、沉 2、没有阴影；不可用是灰底没阴影。
+/// `r` 是常态时按钮本身（不含阴影），返回这次画的按钮面，内容画在它中间
+pub fn primary(c: &Canvas, r: RectF, st: State, s: f32) -> RectF {
+    let (fill, d, shadow) = match st {
+        State::Hover => (ACCENT_HOVER, -s.round(), 3.0),
+        State::Press => (ACCENT_PRESS, (2.0 * s).round(), 0.0),
+        State::Off => (FAINT, 0.0, 0.0),
+        _ => (ACCENT, 0.0, 2.0),
+    };
+    let face = rectf(r.left + d, r.top + d, r.right + d, r.bottom + d);
+    block(c, face, 7.0, shadow, fill, s);
+    face
+}
+
+/// 带字的次按钮（取消、浏览…）：白底、墨色描边、2,2 实心阴影，悬停浅紫，动法和主按钮一样
+pub fn secondary(c: &Canvas, r: RectF, st: State, s: f32) -> RectF {
+    let (fill, d, shadow) = match st {
+        State::Hover => (HOVER, -s.round(), 3.0),
+        State::Press => (PRESS, (2.0 * s).round(), 0.0),
+        _ => (SURF, 0.0, 2.0),
+    };
+    let face = rectf(r.left + d, r.top + d, r.right + d, r.bottom + d);
+    block(c, face, 7.0, shadow, fill, s);
+    face
+}
 
 /// 0xRRGGBB → 颜色
 pub fn rgb(c: u32) -> Color {
@@ -30,44 +138,67 @@ pub fn frame_px(c: &Canvas, r: Rect, rgb: u32) {
     }
 }
 
-/// 深色浮层（尺寸读数、工具提示、钉图读数）：高 22，内边距 3 × 7，圆角 4
+/// 浮层。工具提示：墨色底白字，高 26、圆角 5；读数（尺寸、缩放比例）：柠檬黄底、墨色粗字、2 描边加 2,2 实心阴影，高 24。
+/// `w`、`h` 连阴影一起算
 pub struct Hud {
     pub w: i32,
     pub h: i32,
     parts: Vec<(Text, f32, u32)>,
     scale: f32,
+    readout: bool,
 }
 
-pub const HUD_TEXT2: u32 = 0xB4B4B8;
+/// 工具提示里的快捷键这类次要字
+pub const HUD_TEXT2: u32 = PICK;
 
 impl Hud {
-    /// `parts`：(文字, 颜色)，依次排开，段间距 8；12 号界面字，数字等宽
+    /// 工具提示。`parts`：(文字, 颜色)，依次排开，段间距 8；12 号界面字，数字等宽
     pub fn new(parts: &[(&str, u32)], scale: f32) -> Option<Hud> {
-        let mut x = 7.0 * scale;
+        Hud::make(parts, scale, false)
+    }
+
+    /// 读数：主要的字用 INK，次要的用 MUTED
+    pub fn readout(parts: &[(&str, u32)], scale: f32) -> Option<Hud> {
+        Hud::make(parts, scale, true)
+    }
+
+    fn make(parts: &[(&str, u32)], scale: f32, readout: bool) -> Option<Hud> {
+        let pad = if readout { 8.0 } else { 9.0 } * scale;
+        let mut x = pad;
         let mut v = Vec::new();
         for (i, (t, c)) in parts.iter().enumerate() {
             if i > 0 {
                 x += 8.0 * scale;
             }
-            let l = Text::tabular(Face::Ui, 12.0 * scale, false, t)?;
+            // 读数第一段加粗，后面的提示不加粗
+            let l = Text::tabular(Face::Ui, 12.0 * scale, readout && i == 0, t)?;
             let w = l.width();
             v.push((l, x, *c));
             x += w;
         }
-        Some(Hud { w: (x + 7.0 * scale).ceil() as i32, h: (22.0 * scale).round() as i32, parts: v, scale })
+        let (w, h) = if readout { (x + pad + 2.0 * scale, 26.0 * scale) } else { (x + pad, 26.0 * scale) };
+        Some(Hud { w: w.ceil() as i32, h: h.round() as i32, parts: v, scale, readout })
     }
 
     pub fn draw(&self, c: &Canvas, x: i32, y: i32) {
         let (x, y, s) = (x as f32, y as f32, self.scale);
-        c.fill_round(rectf(x, y, x + self.w as f32, y + self.h as f32), 4.0 * s, rgba(0x1C1C1E, 0.92));
+        let body = if self.readout {
+            let d = (2.0 * s).round();
+            let r = rectf(x, y, x + self.w as f32 - d, y + self.h as f32 - d);
+            block(c, r, 5.0, 2.0, PICK, s);
+            r
+        } else {
+            let r = rectf(x, y, x + self.w as f32, y + self.h as f32);
+            c.fill_round(r, 5.0 * s, rgb(INK));
+            r
+        };
         for (l, dx, col) in &self.parts {
-            // 行高 16 在 22 里居中
-            c.text(l, x + dx, y + 3.0 * s, rgb(*col));
+            c.text(l, x + dx, body.top + (body.bottom - body.top - l.height()) / 2.0, rgb(*col));
         }
     }
 }
 
-// ---- 自绘图标：20 × 20 网格，1.5 描边，圆头圆角 ----
+// ---- 自绘图标：20 × 20 网格，2 描边，圆头圆角 ----
 
 /// (名字, [(SVG 路径, 是否填充)])；矩形、圆、椭圆已经换成路径。只用 M L H V C A Z 及其小写形式。
 const ICONS: &[(&str, &[(&str, bool)])] = &[
@@ -92,7 +223,6 @@ const ICONS: &[(&str, &[(&str, bool)])] = &[
     // 录屏：圆环里一个实心圆点；停止：实心圆角方块
     ("record", &[("M3 10A7 7 0 1 0 17 10A7 7 0 1 0 3 10Z", false), ("M7 10A3 3 0 1 0 13 10A3 3 0 1 0 7 10Z", true)]),
     // 秒表：录屏选区上的「延时开始」
-    ("timer", &[("M4 11A6 6 0 1 0 16 11A6 6 0 1 0 4 11Z", false), ("M8 2.5h4M10 2.5V5M10 11V7.8M14.8 5.2l1.2-1.2", false)]),
     ("stop", &[("M7 5.5h6A1.5 1.5 0 0 1 14.5 7v6A1.5 1.5 0 0 1 13 14.5H7A1.5 1.5 0 0 1 5.5 13V7A1.5 1.5 0 0 1 7 5.5Z", true)]),
     ("save", &[("M10 3.5v9M6.5 9 10 12.5 13.5 9M4 13.5V15c0 .8.7 1.5 1.5 1.5h9c.8 0 1.5-.7 1.5-1.5v-1.5", false)]),
     ("cancel", &[("M5.5 5.5l9 9M14.5 5.5l-9 9", false)]),
@@ -113,6 +243,14 @@ const ICONS: &[(&str, &[(&str, bool)])] = &[
     // 胶囊的状态图标里的白色记号，画在 16 × 16 网格上
     ("ok_mark", &[("M4.7 8.2 7 10.5l4.3-4.8", false)]),
     ("err_mark", &[("M5.5 5.5l5 5M10.5 5.5l-5 5", false)]),
+    // 截图（裁切角）、设置（滑杆）、退出（电源）、播放、暂停、编辑、加号
+    ("crop", &[("M6 2.5V14h11.5M2.5 6H14v11.5", false)]),
+    ("sliders", &[("M3.5 6h7.5M15 6h1.5M3.5 14h1.5M9 14h7.5M11 6a2 2 0 1 0 4 0a2 2 0 1 0-4 0M5 14a2 2 0 1 0 4 0a2 2 0 1 0-4 0", false)]),
+    ("power", &[("M10 3.5v6M6.2 5.6a6 6 0 1 0 7.6 0", false)]),
+    ("play", &[("M7 5.2v9.6a.6.6 0 0 0 .9.5l7.4-4.8a.6.6 0 0 0 0-1L7.9 4.7a.6.6 0 0 0-.9.5z", true)]),
+    ("pause", &[("M6.5 5h2.2v10H6.5zM11.3 5h2.2v10h-2.2z", true)]),
+    ("edit", &[("M12.5 4.5l3 3L8 15H5v-3zM10.5 6.5l3 3", false)]),
+    ("plus", &[("M10 4.5v11M4.5 10h11", false)]),
 ];
 
 /// SVG 路径里的命令字母和数字，依次取
@@ -241,7 +379,7 @@ pub fn icon(c: &Canvas, name: &str, x: f32, y: f32, size: f32, color: Color) {
             if *filled {
                 c.fill_path(p, color);
             } else {
-                c.stroke_path(p, color, 1.5, Stroke::Round);
+                c.stroke_path(p, color, 2.0, Stroke::Round);
             }
         }
         c.set_transform(base);

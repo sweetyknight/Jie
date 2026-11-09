@@ -111,6 +111,8 @@ pub enum Kind {
     RecFrame,
     /// 录屏控制条：透明处鼠标穿透、不抢焦点（放在录制区域里时要调 `hide_from_capture`）
     RecBar,
+    /// 托盘面板：透明、置顶、拿键盘；失去前台时收到 `Deactivate`
+    Tray,
 }
 
 /// 建窗口的参数。`rect` 是窗口在桌面上的位置（物理像素）；设置窗口给的是内容区，标题栏另加

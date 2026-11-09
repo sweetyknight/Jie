@@ -379,18 +379,19 @@ fn tray_icon() -> Option<Retained<NSImage>> {
     {
         let c = Canvas::new(&bitmap, bitmap.full(), true);
         c.clear(Color::default());
+        // 应用图标「取景框」的单色版（scripts/macos/icon.swift）：三个角 + 右下角圆角方块，按 100 网格 × 0.36 取整
         let color = Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 };
         for (a, b) in [
-            ((5.0, 14.0), (5.0, 5.0)),
-            ((5.0, 5.0), (14.0, 5.0)),
-            ((22.0, 5.0), (30.0, 5.0)),
-            ((30.0, 5.0), (30.0, 17.0)),
-            ((5.0, 22.0), (5.0, 30.0)),
-            ((5.0, 30.0), (17.0, 30.0)),
+            ((5.5, 15.0), (5.5, 5.5)),
+            ((5.5, 5.5), (15.0, 5.5)),
+            ((21.0, 5.5), (29.5, 5.5)),
+            ((29.5, 5.5), (29.5, 14.5)),
+            ((5.5, 21.0), (5.5, 29.5)),
+            ((5.5, 29.5), (14.5, 29.5)),
         ] {
-            c.line(a, b, color, 3.0, Stroke::Round);
+            c.line(a, b, color, 3.5, Stroke::Round);
         }
-        c.fill_rect(super::RectF { left: 23.0, top: 23.0, right: 32.0, bottom: 32.0 }, color);
+        c.fill_round(super::RectF { left: 19.5, top: 19.5, right: 30.5, bottom: 30.5 }, 2.0, color);
     }
     let cg = bitmap.image()?;
     let rep = NSBitmapImageRep::initWithCGImage(NSBitmapImageRep::alloc(), &cg);

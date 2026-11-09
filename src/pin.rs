@@ -1,8 +1,10 @@
 //! 钉图：置顶、无边框，出现在选区原来的位置，100% 大小。
 //! 保存原图和标注对象（不合成死图），标注在绘制时叠上去；缩小时另存一张显示用的图，内存不超过原图的 2 倍。
-//! 右键「编辑」在钉图上接着标注：鼠标坐标按缩放换成原图像素交给标注编辑器，操作栏是贴在旁边的单独小窗口（bar.rs）。
+//! 鼠标停在钉图上时下面挂出悬停条（编辑、取字、翻译、复制、保存、关闭），离开钉图和悬停条 300ms 后收起；右键菜单也留着。
+//! 「编辑」在钉图上接着标注：鼠标坐标按缩放换成原图像素交给标注编辑器，操作栏是贴在旁边的单独小窗口（bar.rs）。
 //!
-//! 动图钉图（录屏结果）：从 GIF 文件逐帧解码，叠到 `img` 上循环播放，内存里只有当前这一帧；不能编辑标注，复制、保存的是 GIF 文件。
+//! 动图钉图（录屏结果）：从 GIF 文件逐帧解码，叠到 `img` 上循环播放，内存里只有当前这一帧；不能编辑标注，复制、保存的是 GIF 文件，
+//! 悬停条第一个按钮是暂停/播放。
 //! 刚录完时是「结果」状态：下面挂结果条（复制、保存、钉住、丢弃），复制或保存以后就关掉，钉住以后是普通的动图钉图。
 //! 钉图不知道录屏：录屏只管把文件交过来（`create_gif`）。
 
@@ -13,7 +15,7 @@ use crate::annotate::{Doc, Editor, Pt};
 use crate::image_io;
 use crate::plat::{self, Affine, Bitmap, Button, Canvas, Cursor, Event, Handler, Image, Key, MenuItem, Mods, Point, Rect, Spec, Win};
 use crate::toast::{self, Kind};
-use crate::toolbar::{Act, opts::Item, tool_of};
+use crate::toolbar::{self, Act, Items, opts::Item, tool_of};
 use crate::ui::{self, Hud, rectf};
 use std::path::PathBuf;
 
@@ -21,6 +23,8 @@ use std::path::PathBuf;
 const HUD_TIMER: usize = 1;
 /// 动图换下一帧
 const ANIM_TIMER: usize = 2;
+/// 鼠标离开钉图后隔一会儿看还在不在钉图或悬停条上
+const HOVER_TIMER: usize = 3;
 
 const CMD_EDIT: usize = 1;
 const CMD_OCR: usize = 2;
@@ -53,8 +57,10 @@ struct Pin {
     /// 滚轮累计量：触控板一次只给一点，攒够 120 才走一格
     wheel_acc: i32,
     drag: Drag,
-    /// 编辑中或者录屏结果：操作栏窗口
+    /// 编辑中、录屏结果、鼠标停在上面：操作栏窗口
     chrome: Option<Win>,
+    /// 操作栏是悬停条
+    hovering: bool,
     /// 动图钉图
     anim: Option<Anim>,
     /// 录屏结果：下面挂着结果条
@@ -74,7 +80,7 @@ fn open(img: Bitmap, at: Point, ed: Editor, anim: Option<Anim>, preview: bool) -
     let (w, h) = (img.w, img.h);
     // 和录制时的边框一样粗（3 DIP），录完框还在原来的位置
     let frame = if anim.is_some() && crate::settings::get().gif_frame { (3.0 * plat::monitor_at(at).scale()).round().max(2.0) as i32 } else { 0 };
-    let pin = Pin { img, ed, view: None, zoom: 100, opacity: 100, hud: None, wheel_acc: 0, drag: Drag::None, chrome: None, anim, preview, frame };
+    let pin = Pin { img, ed, view: None, zoom: 100, opacity: 100, hud: None, wheel_acc: 0, drag: Drag::None, chrome: None, hovering: false, anim, preview, frame };
     // 图片左上角在 `at`，框画在外面
     let rect = Rect { left: at.x - frame, top: at.y - frame, right: at.x + w + frame, bottom: at.y + h + frame };
     let win = Win::open(Spec { kind: plat::Kind::Pin, rect, title: "Jie 钉图", owner: None }, pin)?;
@@ -87,17 +93,18 @@ pub fn create(img: Bitmap, at: Point, ed: Editor) {
     open(img, at, ed, None, false);
 }
 
-/// 动图钉图：GIF 文件 `path` 钉在 `at`（屏幕坐标）开始循环播放；`preview` 时是录屏结果，下面挂结果条。
-/// 钉图开着期间文件要一直在（逐帧从文件解码，复制到剪贴板的也是这个文件）
-pub fn create_gif(path: PathBuf, at: Point, preview: bool) -> Result<(), String> {
+/// 动图钉图：GIF 文件 `path` 钉在 `at`（屏幕坐标）开始循环播放；`result` 有值时是录屏结果，下面挂结果条，
+/// 结果条最左边写这段说明（时长和大小）。钉图开着期间文件要一直在（逐帧从文件解码，复制到剪贴板的也是这个文件）
+pub fn create_gif(path: PathBuf, at: Point, result: Option<String>) -> Result<(), String> {
+    let preview = result.is_some();
     let mut player = Player::open(&path)?;
     let mut img = Bitmap::new(player.w, player.h).ok_or("内存不够，打不开动图")?;
     let delay = player.next(img.pixels_mut())?;
     let ed = Editor::new(Doc::default(), plat::monitor_at(at).scale());
     let win = open(img, at, ed, Some(Anim { player, path, playing: true }), preview).ok_or("打不开动图窗口")?;
     win.timer(ANIM_TIMER, delay.as_millis().max(10) as u32);
-    if preview {
-        win.with(|p: &mut Pin| p.show_result(win));
+    if let Some(info) = result {
+        win.with(|p: &mut Pin| p.show_result(win, info));
     }
     Ok(())
 }
@@ -145,9 +152,9 @@ impl Pin {
         (f(self.img.w), f(self.img.h))
     }
 
-    /// 在编辑标注（录屏结果下面那条不算）
+    /// 在编辑标注（录屏结果、悬停条不算）
     fn editing(&self) -> bool {
-        self.chrome.is_some() && !self.preview
+        self.chrome.is_some() && !self.preview && !self.hovering
     }
 
     /// 图片外的选区色描边：编辑时 2px；动图按设置一直有框（见 `frame`）；平时没有
@@ -180,7 +187,7 @@ impl Pin {
     /// 读数：图片右下角往里 8
     fn hud(&self, w: Win) -> Option<(Hud, Rect)> {
         let s = w.scale();
-        let hud = Hud::new(&[(self.hud.as_deref()?, 0xFFFFFF)], s)?;
+        let hud = Hud::readout(&[(self.hud.as_deref()?, ui::INK)], s)?;
         let ((iw, ih), b) = (self.shown(), self.border());
         let g = (8.0 * s).round() as i32;
         let (x, y) = (b + iw - g - hud.w, b + ih - g - hud.h);
@@ -313,6 +320,54 @@ impl Pin {
         w.ime(self.ed.caret(self.client_of()));
     }
 
+    /// 建操作栏窗口，按钮点了交回这个钉图
+    fn open_bar(&mut self, w: Win, items: &'static Items, info: Option<String>) {
+        self.chrome = bar::open(w, items, info, |pin, b| _ = pin.with(|p: &mut Pin| p.act(pin, b)));
+        self.place_bar(w);
+    }
+
+    /// 悬停条的按钮：动图播放中、暂停时不一样
+    fn hover_items(&self) -> &'static Items {
+        match &self.anim {
+            Some(a) if a.playing => &toolbar::HOVER_GIF,
+            Some(_) => &toolbar::HOVER_GIF_PAUSED,
+            None => &toolbar::HOVER,
+        }
+    }
+
+    /// 鼠标在钉图上：挂出悬停条（已经有操作栏、正在拖时不挂）
+    fn hover(&mut self, w: Win) {
+        w.kill_timer(HOVER_TIMER);
+        if self.chrome.is_none() && matches!(self.drag, Drag::None) {
+            self.hovering = true;
+            self.open_bar(w, self.hover_items(), None);
+            self.hovering = self.chrome.is_some();
+        }
+    }
+
+    /// 离开后隔 300ms 看一次：鼠标不在钉图、也不在悬停条上就收起
+    fn hover_check(&mut self, w: Win) {
+        w.kill_timer(HOVER_TIMER);
+        if !self.hovering {
+            return;
+        }
+        let c = plat::cursor_pos();
+        let over = |r: Rect| c.x >= r.left && c.x < r.right && c.y >= r.top && c.y < r.bottom;
+        if over(w.rect()) || self.chrome.is_some_and(|b| over(b.rect())) {
+            w.timer(HOVER_TIMER, 300);
+        } else {
+            self.unhover();
+        }
+    }
+
+    fn unhover(&mut self) {
+        if std::mem::take(&mut self.hovering)
+            && let Some(c) = self.chrome.take()
+        {
+            c.close();
+        }
+    }
+
     /// 编辑中：操作栏按钉图现在的位置重新摆好、重画
     fn place_bar(&mut self, w: Win) {
         if let Some(c) = self.chrome {
@@ -320,25 +375,21 @@ impl Pin {
         }
     }
 
-    /// 进入编辑：窗口往外扩 2px 画描边、图片不动；操作栏出现
+    /// 进入编辑：悬停条换成编辑的操作栏；窗口往外扩 2px 画描边、图片不动
     fn enter_edit(&mut self, w: Win) {
+        self.unhover();
         if self.chrome.is_some() || self.anim.is_some() {
-            return;
-        }
-        self.chrome = bar::open(w, false);
-        if self.chrome.is_none() {
             return;
         }
         let r = w.rect();
         w.set_rect(Rect { left: r.left - 2, top: r.top - 2, right: r.right + 2, bottom: r.bottom + 2 });
         w.invalidate_all();
-        self.place_bar(w);
+        self.open_bar(w, &toolbar::PIN, None);
     }
 
-    /// 录屏结果：下面挂结果条
-    fn show_result(&mut self, w: Win) {
-        self.chrome = bar::open(w, true);
-        self.place_bar(w);
+    /// 录屏结果：下面挂结果条，最左边写 `info`
+    fn show_result(&mut self, w: Win, info: String) {
+        self.open_bar(w, &toolbar::RESULT, Some(info));
     }
 
     /// 结果条上的「钉住」：收起结果条，留下普通的动图钉图
@@ -381,7 +432,7 @@ impl Pin {
         }
     }
 
-    /// 暂停或接着播
+    /// 暂停或接着播；悬停条上的按钮跟着换
     fn toggle_play(&mut self, w: Win) {
         let Some(a) = &mut self.anim else { return };
         a.playing = !a.playing;
@@ -390,11 +441,16 @@ impl Pin {
         } else {
             w.kill_timer(ANIM_TIMER);
         }
+        if self.hovering
+            && let Some(c) = self.chrome
+        {
+            bar::set_items(c, self.hover_items());
+        }
     }
 
     /// 结束编辑，改动保留（撤销记录留在 `ed.doc` 里，下次进来接着撤销）；正在拖的、正在输入的先收尾
     fn exit_edit(&mut self, w: Win) {
-        if self.preview {
+        if !self.editing() {
             return;
         }
         let Some(c) = self.chrome.take() else { return };
@@ -474,7 +530,7 @@ impl Pin {
     /// 右键菜单的命令
     fn command(&mut self, w: Win, cmd: usize) {
         match cmd {
-            CMD_EDIT if self.chrome.is_some() => self.exit_edit(w),
+            CMD_EDIT if self.editing() => self.exit_edit(w),
             CMD_EDIT => self.enter_edit(w),
             CMD_OCR | CMD_TRANSLATE => self.recognize(w, cmd == CMD_OCR),
             CMD_COPY => self.copy(w),
@@ -522,6 +578,9 @@ impl Pin {
             Act::Save => self.save(w),
             Act::Copy => self.copy(w),
             Act::Done => self.exit_edit(w),
+            Act::Edit => self.enter_edit(w),
+            Act::Pause | Act::Play => self.toggle_play(w),
+            Act::Close => w.close(),
             _ => {}
         }
     }
@@ -565,6 +624,8 @@ impl Handler for Pin {
         match e {
             Event::Focus(true) => w.invalidate_all(),
             Event::Timer(ANIM_TIMER) => self.tick(w),
+            Event::Timer(HOVER_TIMER) => self.hover_check(w),
+            Event::Leave if self.hovering => w.timer(HOVER_TIMER, 300),
             // 录屏结果：双击复制（和截图一样），按键都是结果条上的快捷键
             Event::Down { button: Button::Left, double: true, .. } if self.preview => self.copy(w),
             Event::Key { key, mods } if self.preview => match key {
@@ -595,7 +656,7 @@ impl Handler for Pin {
                     let q = self.to_img(p);
                     self.update(w, |s| s.ed.drag_to(q, mods.shift));
                 }
-                Drag::None => {}
+                Drag::None => self.hover(w),
             },
             Event::Up { button: Button::Left, .. } | Event::CaptureLost => self.end_drag(w),
             Event::Up { button: Button::Right, .. } => self.menu(w, w.cursor_pos()),
@@ -752,8 +813,9 @@ mod tests {
         w.send(Event::Wheel { delta: 600, p: at, mods: Mods::default() });
         assert_eq!((s.zoom, s.ed.zoom), (150, 1.5));
         assert_eq!(w.rect(), Rect { left: at.x - 2, top: at.y - 2, right: at.x + 602, bottom: at.y + 452 });
+        // 操作栏窗口连右下 4 的实心阴影
         let br = s.chrome.unwrap().rect();
-        assert_eq!((br.right, br.top), (at.x + 600, at.y + 450 + (8.0 * sc).round() as i32));
+        assert_eq!((br.right - (4.0 * sc).round() as i32, br.top), (at.x + 600, at.y + 450 + (8.0 * sc).round() as i32));
 
         // 点操作栏的矩形工具，在钉图上画一个：客户区 (302, 152) → 原图 (200, 100)
         click(s, Btn::Bar(Act::Rect));
@@ -798,8 +860,31 @@ mod tests {
         w.close();
     }
 
+    /// 悬停条：鼠标挪到钉图上挂出悬停条（不算编辑），停在按钮上出提示；点「编辑标注」换成编辑的操作栏。
+    /// 画面存成 target/test-tmp/pin/hover.png。会在屏幕上出现一下，平时不跑：cargo test pin_hover_flow -- --ignored
+    #[test]
+    #[ignore]
+    fn pin_hover_flow() {
+        let mon = plat::monitor_at(Point::default());
+        let mut img = Bitmap::new(300, 200).unwrap();
+        img.pixels_mut().fill(0xF0);
+        create(img, Point { x: mon.work.left + 500, y: mon.work.top + 150 }, Editor::new(Doc::default(), mon.scale()));
+        let w = *Win::all(plat::Kind::Pin).last().expect("钉图没出来");
+        let s = w.peek::<Pin>();
+        mouse(w, mv, 100, 100);
+        assert!(s.hovering && s.chrome.is_some() && !s.editing() && s.border() == 0);
+        let bar = s.chrome.unwrap();
+        let r = bar.peek::<bar::Chrome>().button(Btn::Bar(Act::Translate));
+        mouse(bar, mv, (r.left + r.right) / 2, (r.top + r.bottom) / 2);
+        bar.send(Event::Timer(bar::TIP_TIMER));
+        shot(w, "hover.png");
+        click(s, Btn::Bar(Act::Edit));
+        assert!(s.editing() && !s.hovering && !bar.alive());
+        w.close();
+    }
+
     /// 录屏结果：合成一段三帧的 GIF（不截屏幕），原位置开出结果钉图：下面是结果条、定时器换帧、画面跟着变；
-    /// 「钉住」收起结果条变成普通动图钉图，菜单能暂停；再开一个点「丢弃」会删掉文件。会在屏幕上出现一下，平时不跑：
+    /// 「钉住」收起结果条变成普通动图钉图，悬停条能暂停、播放；再开一个点「丢弃」会删掉文件。会在屏幕上出现一下，平时不跑：
     /// cargo test gif_result_flow -- --ignored
     #[test]
     #[ignore]
@@ -819,7 +904,7 @@ mod tests {
         };
         let mon = plat::monitor_at(Point::default());
         let at = Point { x: mon.work.left + 300, y: mon.work.top + 200 };
-        create_gif(make("a.gif"), at, true).unwrap();
+        create_gif(make("a.gif"), at, Some("00:03 · 12 KB".into())).unwrap();
         let w = *Win::all(plat::Kind::Pin).last().expect("动图钉图没出来");
         let s = w.peek::<Pin>();
         assert!(s.preview && s.chrome.is_some() && s.anim.is_some());
@@ -836,12 +921,18 @@ mod tests {
         // 「钉住」：结果条收起，还是动图
         click(s, Btn::Bar(Act::Pin));
         assert!(!s.preview && s.chrome.is_none() && s.anim.is_some());
-        w.with(|p: &mut Pin| p.command(w, CMD_PLAY));
+        // 鼠标挪上去挂出悬停条：点暂停，按钮换成播放，再点接着播
+        mouse(w, mv, 10, 10);
+        assert!(s.hovering);
+        click(s, Btn::Bar(Act::Pause));
         assert!(!s.anim.as_ref().unwrap().playing);
+        shot(w, "gif-hover-paused.png");
+        click(s, Btn::Bar(Act::Play));
+        assert!(s.anim.as_ref().unwrap().playing);
         w.close();
         // 再开一个，「丢弃」：窗口关掉、文件删掉
         let b = make("b.gif");
-        create_gif(b.clone(), at, true).unwrap();
+        create_gif(b.clone(), at, Some("00:03 · 12 KB".into())).unwrap();
         let w = *Win::all(plat::Kind::Pin).last().unwrap();
         click(w.peek::<Pin>(), Btn::Bar(Act::Cancel));
         let t0 = std::time::Instant::now();

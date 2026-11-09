@@ -1,4 +1,5 @@
-//! 菜单：系统 TrackPopupMenu + 自绘菜单项（悬停浅灰，不出现系统的蓝色高亮）。
+//! 菜单：系统 TrackPopupMenu + 自绘菜单项（新野兽派配色：白底墨字、悬停浅紫、墨色分组线，不出现系统的蓝色高亮）。
+//! 平台层不能用 ui 的令牌（ui 依赖 plat），颜色在这里照抄一份。
 
 use super::{Canvas, Face, RectF, Text};
 use crate::plat::MenuItem;
@@ -20,7 +21,11 @@ thread_local! {
     static MENU: RefCell<MenuState> = const { RefCell::new(MenuState { items: Vec::new(), scale: 1.0 }) };
 }
 
-const MENU_BG: u32 = 0xF9F9F9;
+const MENU_BG: u32 = 0xFFFFFF;
+const INK: u32 = 0x151317;
+const HOVER: u32 = 0xF1E5FF;
+const MUTED: u32 = 0x57505F;
+const FAINT: u32 = 0xA9A1B0;
 
 fn rgb(c: u32) -> D2D1_COLOR_F {
     let ch = |s: u32| ((c >> s) & 0xFF) as f32 / 255.0;
@@ -95,12 +100,12 @@ pub(crate) fn menu_draw(lp: LPARAM) -> bool {
         c.clear(rgb(MENU_BG));
         if text.is_empty() {
             let y = ((t + b) / 2.0).floor();
-            c.fill_rect(RectF { left: l, top: y, right: rr, bottom: y + s.round().max(1.0) }, rgb(0xE2E2E2));
+            c.fill_rect(RectF { left: l, top: y, right: rr, bottom: y + (2.0 * s).round().max(1.0) }, rgb(INK));
             return;
         }
         let grayed = di.itemState.0 & (ODS_GRAYED.0 | ODS_DISABLED.0) != 0;
         if di.itemState.0 & ODS_SELECTED.0 != 0 && !grayed {
-            c.fill_round(RectF { left: l, top: t, right: rr, bottom: b }, 4.0 * s, rgb(0xEAEAEA));
+            c.fill_round(RectF { left: l, top: t, right: rr, bottom: b }, 7.0 * s, rgb(HOVER));
         }
         let put = |t2: &str, b2: bool, right: bool, color: u32| {
             if let Some(lay) = Text::new(Face::Segoe, 12.0 * s, b2, t2) {
@@ -108,12 +113,12 @@ pub(crate) fn menu_draw(lp: LPARAM) -> bool {
                 c.text(&lay, x, t + (b - t - lay.height()) / 2.0, rgb(color));
             }
         };
-        put(text, *bold, false, if grayed { 0xA0A0A0 } else { 0x1A1A1A });
+        put(text, *bold, false, if grayed { FAINT } else { INK });
         if *checked {
-            c.fill_ellipse(l + 13.0 * s, (t + b) / 2.0, 3.0 * s, 3.0 * s, rgb(0x1A1A1A));
+            c.fill_ellipse(l + 13.0 * s, (t + b) / 2.0, 3.0 * s, 3.0 * s, rgb(INK));
         }
         if !key.is_empty() {
-            put(key, false, true, if grayed { 0xA0A0A0 } else { 0x707070 });
+            put(key, false, true, if grayed { FAINT } else { MUTED });
         }
     });
     true

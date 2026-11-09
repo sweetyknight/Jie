@@ -1,7 +1,7 @@
 //! 录屏：选好的区域外画一圈边框（选区颜色），旁边放控制条，马上开始截（选了延时就先在区域中间倒数）；平台层按帧率截这块活的屏幕，
 //! 截屏线程上边截边编成 GIF 写进临时文件。停止后把动图交给钉图（原位置循环播放，下面是结果条），底部胶囊报时长和大小。
 //! 边框和控制条靠放在区域外面录不进去，远程桌面、会议共享也看得到。贴着屏幕边、外面画不下的那条边框不画；
-//! 控制条外面放不下（框满整块屏幕）就放在区域里的任务栏上，设成不被截屏：照样看得到，录的时候平台层把它那块换成它底下的实时画面（见 PLAN.md §9）。
+//! 控制条外面放不下（框满整块屏幕）就放在区域里的任务栏上，设成不被截屏：照样看得到，录的时候平台层把它那块换成它底下的实时画面。
 //! 只依赖平台层、动图编码（anim）、钉图、胶囊、快捷键和设置；不知道遮罩和外壳，选区由调用方给。
 
 use crate::anim::Writer;
@@ -10,7 +10,7 @@ use crate::pin;
 use crate::plat::{self, Button, Canvas, Color, Cursor, Event, Face, Handler, Monitor, Point, Rect, Spec, Text, Win};
 use crate::settings;
 use crate::toast::{self, Kind};
-use crate::ui::{self, rectf, rgb, rgba};
+use crate::ui::{self, Hud, rectf, rgb};
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -20,10 +20,8 @@ use std::time::{Duration, Instant};
 /// 控制条、倒计时的刷新定时器（250ms 一次：倒数、计时、圆点闪烁）
 const TICK: usize = 1;
 const TICK_MS: u32 = 250;
-const TEXT: u32 = 0x1A1A1A;
-/// 主按钮和截图操作栏的主按钮一样：常态、悬停、按下
-const ACCENT: [u32; 3] = [0x9C44EC, 0xA95CF0, 0x8733D4];
-const HINT: u32 = 0x6B6B70;
+/// 控制条上的工具提示：鼠标停 400ms 后出现
+const TIP: usize = 2;
 
 /// 截屏线程和界面线程共用：编码器（停的时候拿回来收尾），写出错时的原因
 struct Shared {
@@ -63,6 +61,11 @@ pub fn cleanup() {
 /// 正在录（包括开始前的倒计时）
 pub fn active() -> bool {
     SESSION.with_borrow(|s| s.is_some())
+}
+
+/// 开始截的时刻；还在倒计时、没在录是 None
+pub fn started_at() -> Option<Instant> {
+    SESSION.with_borrow(|s| s.as_ref()?.rec.as_ref().map(|r| r.1))
 }
 
 fn lock(m: &Mutex<Shared>) -> std::sync::MutexGuard<'_, Shared> {
@@ -186,16 +189,14 @@ pub fn stop() {
         return;
     };
     let at = Point { x: e.region.left, y: e.region.top };
-    let result = e.writer.and_then(|w| w.finish().map_err(|x| x.to_string())).and_then(|_| pin::create_gif(e.path.clone(), at, true));
-    match result {
-        Ok(()) => {
-            let bytes = std::fs::metadata(&e.path).map_or(0, |m| m.len());
-            toast::show(&e.mon, Kind::Ok, &format!("录制完成 · {} · {}", clock(secs), size(bytes)));
-        }
-        Err(x) => {
-            let _ = std::fs::remove_file(&e.path);
-            toast::show(&e.mon, Kind::Err, &format!("录屏失败：{x}"));
-        }
+    // 时长和大小写在结果条最左边，录完不另外弹胶囊；出错照旧弹
+    let result = e.writer.and_then(|w| w.finish().map_err(|x| x.to_string())).and_then(|_| {
+        let bytes = std::fs::metadata(&e.path).map_or(0, |m| m.len());
+        pin::create_gif(e.path.clone(), at, Some(format!("{} · {}", clock(secs), size(bytes))))
+    });
+    if let Err(x) = result {
+        let _ = std::fs::remove_file(&e.path);
+        toast::show(&e.mon, Kind::Err, &format!("录屏失败：{x}"));
     }
 }
 
@@ -266,12 +267,16 @@ fn frame(mon: &Monitor, r: Rect, color: u32) -> Vec<Win> {
     v
 }
 
-// ---- 倒计时：区域中间的深色圆角块，大数字和「按 … 停止录制」；鼠标穿透。开始截之前就关掉，不用设不被截屏 ----
+// ---- 倒计时：区域中间一块柠檬黄方块写大数字，下面一行「按 … 停止录制」；鼠标穿透。开始截之前就关掉，不用设不被截屏 ----
+
+/// 倒计时方块的边长、实心阴影（DIP）
+const CD_BOX: f32 = 104.0;
+const CD_SHADOW: f32 = 6.0;
 
 struct Countdown {
     scale: f32,
     at: Instant,
-    hint: Option<Text>,
+    hint: Option<Hud>,
     /// 上次画的数字，变了才重画
     shown: u64,
 }
@@ -285,11 +290,16 @@ impl Countdown {
     /// 在区域中间（挪进显示器里）
     fn open(mon: Monitor, region: Rect, at: Instant) -> Option<Win> {
         let s = mon.scale();
+        let px = |d: f32| (d * s).round() as i32;
         let key = hotkeys::label(hotkeys::RECORD);
-        let hint = if key.is_empty() { "点控制条上的「停止」结束录制".to_string() } else { format!("按 {key} 停止录制") };
-        let hint = Text::new(Face::Ui, 13.0 * s, false, &hint);
-        let w = (hint.as_ref().map_or(0.0, |t| t.width()) + 40.0 * s).max(160.0 * s).ceil() as i32;
-        let h = (140.0 * s).round() as i32;
+        let hint = if key.is_empty() {
+            Hud::new(&[("点控制条上的停止按钮结束录制", 0xFFFFFF)], s)
+        } else {
+            Hud::new(&[("按", 0xFFFFFF), (key.as_str(), ui::HUD_TEXT2), ("停止录制", 0xFFFFFF)], s)
+        };
+        let boxed = px(CD_BOX) + px(CD_SHADOW);
+        let w = hint.as_ref().map_or(0, |h| h.w).max(boxed);
+        let h = boxed + hint.as_ref().map_or(0, |h| px(12.0) + h.h);
         let m = mon.rect;
         let x = ((region.left + region.right - w) / 2).clamp(m.left, m.right - w);
         let y = ((region.top + region.bottom - h) / 2).clamp(m.top, m.bottom - h);
@@ -315,19 +325,24 @@ impl Handler for Countdown {
     fn paint(&mut self, _w: Win, c: &Canvas) {
         let s = self.scale;
         let a = c.area();
-        let (w, h) = ((a.right - a.left) as f32, (a.bottom - a.top) as f32);
+        let w = (a.right - a.left) as f32;
         c.clear(Color::default());
-        c.fill_round(rectf(0.0, 0.0, w, h), 16.0 * s, rgba(0x1C1C1E, 0.86));
-        if let Some(n) = Text::tabular(Face::Ui, 64.0 * s, true, &self.shown.to_string()) {
-            c.text(&n, (w - n.width()) / 2.0, 12.0 * s, rgb(0xFFFFFF));
+        let (b, d) = ((CD_BOX * s).round(), (CD_SHADOW * s).round());
+        let x = ((w - b - d) / 2.0).round();
+        let r = rectf(x, 0.0, x + b, b);
+        ui::block(c, r, 14.0, CD_SHADOW, ui::PICK, s);
+        if let Some(n) = Text::tabular(Face::Ui, 56.0 * s, true, &self.shown.to_string()) {
+            c.text(&n, x + (b - n.width()) / 2.0, (b - n.height()) / 2.0, rgb(ui::INK));
         }
-        if let Some(t) = &self.hint {
-            c.text(t, (w - t.width()) / 2.0, h - 18.0 * s - t.height(), rgb(ui::HUD_TEXT2));
+        if let Some(h) = &self.hint {
+            h.draw(c, ((w - h.w as f32) / 2.0).round() as i32, (b + d + 12.0 * s).round() as i32);
         }
     }
 }
 
-// ---- 控制条：倒计时里「● 00:00  3 秒后开始  [● 立即开始] 取消」，录制中「● 00:12  录制中 · 1.3 MB  [■ 停止] 放弃」 ----
+// ---- 控制条：倒计时里「● 00:00  3 秒后开始 | [▶] [✕]」，录制中「● 00:12  录制中 · 1.3 MB | [■] [🗑]」 ----
+// 样式和操作栏一样（白底、墨色描边、4,4 实心阴影）；按钮只放图标，鼠标停 400ms 出提示（名字和快捷键）。
+// 窗口比控制条多出放提示的一截，放在不压着录制区域的那一边，提示不会录进去
 
 #[derive(Clone, Copy, PartialEq)]
 enum Btn {
@@ -345,11 +360,21 @@ struct ControlBar {
     bytes: Arc<AtomicU64>,
     /// 圆点的颜色（选区颜色）
     color: u32,
+    /// 录屏快捷键的名字，提示里写
+    key: String,
+    /// 控制条本体（连阴影）在窗口里的位置；窗口上面或下面还留着放提示的那一截
+    body: Rect,
     /// 两个按钮在窗口里的位置
     main: Rect,
     second: Rect,
+    /// 状态文字、分组线离本体左边多远（DIP）
+    status_x: f32,
+    sep_x: f32,
     hot: Option<Btn>,
     down: Option<Btn>,
+    /// 显示提示的按钮；提示在本体上方（否则下方）
+    tip: Option<Btn>,
+    tip_up: bool,
 }
 
 /// 时间「01:05」，超过一小时「1:01:05」
@@ -405,53 +430,93 @@ fn bar_rect(mon: &Rect, work: &Rect, region: Rect, (bw, bh): (i32, i32), b: i32,
     (spot, true)
 }
 
-// 尺寸（DIP）：高 40，左边距 14，圆点直径 10，按钮高 30
-const BAR_H: f32 = 40.0;
-const BTN_PAD: f32 = 5.0;
+// 尺寸（DIP）：本体高 48（描边 2 + 内边距 5 + 按钮 34 + 5 + 2），右下阴影 4；圆点中心离左边 19；提示高 26，离本体 6
+const BODY_H: f32 = 48.0;
+const SHADOW: f32 = 4.0;
+const TIP_ROOM: f32 = 6.0 + 26.0;
 
 impl ControlBar {
-    fn label(&self, t: &str, bold: bool) -> Option<Text> {
-        Text::new(Face::Ui, 13.0 * self.scale, bold, t)
-    }
-
-    /// 两个按钮上的字：倒计时里和录制中不一样
-    fn texts(&self) -> (&'static str, &'static str) {
-        if self.started { ("停止", "放弃") } else { ("立即开始", "取消") }
-    }
-
     /// 状态文字：倒计时里是还剩几秒，录制中是「录制中 · 文件大小」
     fn status(&self) -> String {
         if self.started { format!("录制中 · {}", size(self.bytes.load(Ordering::Relaxed))) } else { format!("{} 秒后开始", left(self.at)) }
     }
 
-    /// 按缩放 `s` 排好按钮（按两种状态里宽的那个留位置，换状态不变宽）；返回控制条和它的宽高（像素）
-    /// `at` 到了才开始；已经过了（不延时）就是录制中
-    fn new(s: f32, bytes: Arc<AtomicU64>, at: Instant, color: u32) -> (ControlBar, i32, i32) {
-        let mut bar = ControlBar { scale: s, at, started: Instant::now() >= at, bytes, color, main: Rect::default(), second: Rect::default(), hot: None, down: None };
-        let px = |d: f32| (d * s).round() as i32;
-        let dip = |t: Option<Text>| t.map_or(40.0, |l| l.width() / s);
-        let widest = |ts: &[&str], px: f32, bold: bool| ts.iter().map(|t| dip(Text::tabular(Face::Ui, px * s, bold, t))).fold(0.0, f32::max);
-        // 左边：边距 14 + 圆点 10 + 8 + 时间 + 10 + 状态 + 14
-        let time_w = widest(&["00:00"], 13.0, true);
-        let status_w = widest(&["录制中 · 999.9 MB", "10 秒后开始"], 12.0, false);
-        // 主按钮：10 + 图标 16 + 6 + 字 + 12；次按钮：12 + 字 + 12
-        let main_w = (10.0 + 16.0 + 6.0 + widest(&["立即开始", "停止"], 13.0, true) + 12.0).ceil();
-        let second_w = (12.0 + widest(&["取消", "放弃"], 13.0, false) + 12.0).ceil();
-        let x_main = 14.0 + 10.0 + 8.0 + time_w + 10.0 + status_w + 14.0;
-        let width = x_main + main_w + 4.0 + second_w + BTN_PAD;
-        let (t, b) = (px(BTN_PAD), px(BAR_H - BTN_PAD));
-        bar.main = Rect { left: px(x_main), top: t, right: px(x_main + main_w), bottom: b };
-        bar.second = Rect { left: px(x_main + main_w + 4.0), top: t, right: px(x_main + main_w + 4.0 + second_w), bottom: b };
-        (bar, px(width), px(BAR_H))
+    /// 按钮的提示：名字和快捷键
+    fn tip_text(&self, b: Btn) -> (&'static str, &str) {
+        match (b, self.started) {
+            (Btn::Main, true) => ("停止", &self.key),
+            (Btn::Second, true) => ("放弃，不留文件", ""),
+            (Btn::Main, false) => ("立即开始", ""),
+            (Btn::Second, false) => ("取消", &self.key),
+        }
     }
 
-    /// 摆在区域外面（见 `bar_rect`）；外面放不下才放进区域里，这时设成不被截屏（显示之前）
+    /// 按缩放 `s` 排好（状态文字按两种状态里宽的那个留位置，换状态不变宽）；返回控制条和本体连阴影的宽高（像素），还没留提示的地方。
+    /// `at` 到了才开始；已经过了（不延时）就是录制中
+    fn new(s: f32, bytes: Arc<AtomicU64>, at: Instant, color: u32) -> (ControlBar, i32, i32) {
+        let px = |d: f32| (d * s).round() as i32;
+        let dip = |t: Option<Text>| t.map_or(40.0, |l| l.width() / s);
+        let widest = |ts: &[&str], size: f32| ts.iter().map(|t| dip(Text::tabular(Face::Ui, size * s, true, t))).fold(0.0, f32::max);
+        // 圆点、时间（左 32）、10、状态、10、分组线 2、5、主按钮 44、3、次按钮 34、内边 7
+        let status_x = 32.0 + widest(&["00:00"], 14.0) + 10.0;
+        let sep_x = (status_x + widest(&["录制中 · 999.9 MB", "10 秒后开始"], 12.5) + 10.0).ceil();
+        let x_main = sep_x + 2.0 + 5.0;
+        let width = x_main + 44.0 + 3.0 + 34.0 + 7.0;
+        let (t, b) = (px(7.0), px(7.0 + 34.0));
+        let (w, h) = (px(width) + px(SHADOW), px(BODY_H) + px(SHADOW));
+        let bar = ControlBar {
+            scale: s,
+            at,
+            started: Instant::now() >= at,
+            bytes,
+            color,
+            key: hotkeys::label(hotkeys::RECORD),
+            body: Rect { left: 0, top: 0, right: w, bottom: h },
+            main: Rect { left: px(x_main), top: t, right: px(x_main + 44.0), bottom: b },
+            second: Rect { left: px(x_main + 47.0), top: t, right: px(x_main + 81.0), bottom: b },
+            status_x,
+            sep_x,
+            hot: None,
+            down: None,
+            tip: None,
+            tip_up: false,
+        };
+        (bar, w, h)
+    }
+
+    /// 窗口在本体上方（`up`）或下方多留放提示的一截；返回多出来的高度。放上方时本体和按钮往下挪
+    fn tip_room(&mut self, up: bool) -> i32 {
+        let extra = (TIP_ROOM * self.scale).round() as i32;
+        self.tip_up = up;
+        if up {
+            for r in [&mut self.body, &mut self.main, &mut self.second] {
+                (r.top, r.bottom) = (r.top + extra, r.bottom + extra);
+            }
+        }
+        extra
+    }
+
+    /// 摆在区域外面（见 `bar_rect`）；外面放不下才放进区域里，这时设成不被截屏（显示之前）。
+    /// 提示那一截先找不压着区域、不出屏的一边（下面优先），都不行就找不出屏的
     fn open(mon: Monitor, region: Rect, bytes: Arc<AtomicU64>, at: Instant, color: u32) -> Option<Win> {
         let s = mon.scale();
-        let (bar, bw, bh) = ControlBar::new(s, bytes, at, color);
+        let (mut bar, bw, bh) = ControlBar::new(s, bytes, at, color);
         let px = |d: f32| (d * s).round() as i32;
         let b = border(s);
         let (rect, inside) = bar_rect(&mon.rect, &mon.work, region, (bw, bh), b, px(8.0) + b, px(4.0));
+        let extra = px(TIP_ROOM);
+        let below = Rect { top: rect.bottom, bottom: rect.bottom + extra, ..rect };
+        let above = Rect { top: rect.top - extra, bottom: rect.top, ..rect };
+        let fits = |r: &Rect| r.top >= mon.rect.top && r.bottom <= mon.rect.bottom;
+        let up = if fits(&below) && !overlaps(&below, &region) {
+            false
+        } else if fits(&above) && !overlaps(&above, &region) {
+            true
+        } else {
+            !fits(&below)
+        };
+        bar.tip_room(up);
+        let rect = if up { Rect { top: rect.top - extra, ..rect } } else { Rect { bottom: rect.bottom + extra, ..rect } };
         let w = Win::open(Spec { kind: plat::Kind::RecBar, rect, title: "Jie 录屏", owner: None }, bar)?;
         // 截不下底下的画面时照样显示：没有按钮比录进去更糟
         if inside {
@@ -477,6 +542,18 @@ impl ControlBar {
         (self.started, self.at) = (true, Instant::now());
         Win::later(begin);
     }
+
+    /// 鼠标换了按钮：提示先收起，停 400ms 再出来
+    fn set_hot(&mut self, w: Win, hot: Option<Btn>) {
+        if hot != self.hot {
+            (self.hot, self.tip) = (hot, None);
+            w.kill_timer(TIP);
+            if hot.is_some() && self.down.is_none() {
+                w.timer(TIP, 400);
+            }
+            w.invalidate_all();
+        }
+    }
 }
 
 impl Handler for ControlBar {
@@ -488,20 +565,16 @@ impl Handler for ControlBar {
                 }
                 w.invalidate_all();
             }
-            Event::Move { p, .. } => {
-                let hot = self.button_at(p);
-                if hot != self.hot {
-                    self.hot = hot;
-                    w.invalidate_all();
-                }
+            Event::Timer(TIP) => {
+                w.kill_timer(TIP);
+                self.tip = self.hot;
+                w.invalidate_all();
             }
-            Event::Leave => {
-                if self.hot.take().is_some() {
-                    w.invalidate_all();
-                }
-            }
+            Event::Move { p, .. } => self.set_hot(w, self.button_at(p)),
+            Event::Leave => self.set_hot(w, None),
             Event::Down { p, button: Button::Left, .. } => {
-                self.down = self.button_at(p);
+                (self.down, self.tip) = (self.button_at(p), None);
+                w.kill_timer(TIP);
                 w.invalidate_all();
             }
             // 松开时还在按下的那个按钮上才算点击；停止会关掉这个窗口，等这次处理完再做
@@ -522,62 +595,49 @@ impl Handler for ControlBar {
 
     fn paint(&mut self, _w: Win, c: &Canvas) {
         let s = self.scale;
-        let a = c.area();
-        let (w, h) = ((a.right - a.left) as f32, (a.bottom - a.top) as f32);
+        let f = |r: &Rect| rectf(r.left as f32, r.top as f32, r.right as f32, r.bottom as f32);
         c.clear(Color::default());
-        // 和操作栏一样的浅底、细边框、圆角 8；1 像素以上的整像素描边画在像素中心
-        let lw = s.round().max(1.0);
-        let frame = rectf(lw / 2.0, lw / 2.0, w - lw / 2.0, h - lw / 2.0);
-        c.fill_round(frame, 8.0 * s, rgb(0xFAFAFA));
-        c.stroke_round(frame, 8.0 * s, rgb(0xD4D4D4), lw);
-        let mid = h / 2.0;
-        // 点：录制中每半秒闪一下（选区颜色，外面一圈细灰边，选了白色也看得见），倒计时里是灰的
+        let d = (SHADOW * s).round();
+        let body = f(&self.body);
+        let body = rectf(body.left, body.top, body.right - d, body.bottom - d);
+        ui::block(c, body, 10.0, SHADOW, ui::SURF, s);
+        let (x0, mid, lw) = (body.left, (body.top + body.bottom) / 2.0, ui::line_w(s));
+        // 点：录制中每半秒闪一下（选区颜色，外面一圈墨色，选了白色也看得见），倒计时里是灰的
         let elapsed = self.at.elapsed().as_millis();
-        if !self.started {
-            c.fill_ellipse(19.0 * s, mid, 5.0 * s, 5.0 * s, rgb(0xB0B0B4));
-        } else if (elapsed / 500).is_multiple_of(2) {
-            c.fill_ellipse(19.0 * s, mid, 5.5 * s, 5.5 * s, rgb(0xD4D4D4));
-            c.fill_ellipse(19.0 * s, mid, 5.0 * s, 5.0 * s, rgb(self.color));
+        let dot = if !self.started { Some(ui::FAINT) } else { (elapsed / 500).is_multiple_of(2).then_some(self.color) };
+        if let Some(col) = dot {
+            c.fill_ellipse(x0 + 19.0 * s, mid, 5.0 * s + lw, 5.0 * s + lw, rgb(ui::INK));
+            c.fill_ellipse(x0 + 19.0 * s, mid, 5.0 * s, 5.0 * s, rgb(col));
         }
-        let mut x = 32.0 * s;
         let secs = if self.started { elapsed as u64 / 1000 } else { 0 };
-        if let Some(t) = Text::tabular(Face::Ui, 13.0 * s, true, &clock(secs)) {
-            c.text(&t, x, mid - t.height() / 2.0, rgb(if self.started { TEXT } else { HINT }));
-            x += t.width().max(Text::tabular(Face::Ui, 13.0 * s, true, "00:00").map_or(0.0, |l| l.width())) + 10.0 * s;
+        if let Some(t) = Text::tabular(Face::Ui, 14.0 * s, true, &clock(secs)) {
+            c.text(&t, x0 + 32.0 * s, mid - t.height() / 2.0, rgb(if self.started { ui::INK } else { ui::MUTED }));
         }
-        if let Some(t) = Text::tabular(Face::Ui, 12.0 * s, false, &self.status()) {
-            c.text(&t, x, mid - t.height() / 2.0, rgb(HINT));
+        if let Some(t) = Text::tabular(Face::Ui, 12.5 * s, true, &self.status()) {
+            c.text(&t, x0 + self.status_x * s, mid - t.height() / 2.0, rgb(ui::MUTED));
         }
-        let (main, second) = self.texts();
-        // 主按钮紫底白字，和截图操作栏一样
-        let pressed = |b: Btn| (self.hot == Some(b), self.down == Some(b));
-        let r = self.main;
-        let (l, t, rr, bb) = (r.left as f32, r.top as f32, r.right as f32, r.bottom as f32);
-        let bg = match pressed(Btn::Main) {
-            (true, true) => ACCENT[2],
-            (true, false) => ACCENT[1],
-            _ => ACCENT[0],
-        };
-        c.fill_round(rectf(l, t, rr, bb), 6.0 * s, rgb(bg));
-        // 图标 16 + 6 + 字，整体居中
-        let label = self.label(main, true);
-        let x0 = l + (rr - l - 22.0 * s - label.as_ref().map_or(0.0, |t| t.width())) / 2.0;
-        ui::icon(c, if self.started { "stop" } else { "record" }, x0, t + (bb - t - 16.0 * s) / 2.0, 16.0 * s, rgb(0xFFFFFF));
-        if let Some(label) = label {
-            c.text(&label, x0 + 22.0 * s, t + (bb - t - label.height()) / 2.0, rgb(0xFFFFFF));
-        }
-        let r = self.second;
-        let (l, t, rr, bb) = (r.left as f32, r.top as f32, r.right as f32, r.bottom as f32);
-        let bg = match pressed(Btn::Second) {
-            (true, true) => Some(0xE0E0E0),
-            (true, false) => Some(0xEBEBEB),
-            _ => None,
-        };
-        if let Some(bg) = bg {
-            c.fill_round(rectf(l, t, rr, bb), 6.0 * s, rgb(bg));
-        }
-        if let Some(label) = self.label(second, false) {
-            c.text(&label, l + (rr - l - label.width()) / 2.0, t + (bb - t - label.height()) / 2.0, rgb(TEXT));
+        let sx = (x0 + self.sep_x * s).round();
+        c.fill_rect(rectf(sx, mid - 11.0 * s, sx + lw, mid + 11.0 * s), rgb(ui::INK));
+        let st = |b: Btn| ui::state(true, false, self.hot == Some(b), self.down == Some(b));
+        // 主按钮：紫底白图标，和截图操作栏一样
+        let face = ui::primary(c, f(&self.main), st(Btn::Main), s);
+        let icon = if self.started { "stop" } else { "play" };
+        ui::icon(c, icon, face.left + (face.right - face.left - 20.0 * s) / 2.0, face.top + (face.bottom - face.top - 20.0 * s) / 2.0, 20.0 * s, rgb(0xFFFFFF));
+        let r = f(&self.second);
+        let (dy, fg) = ui::button_bg(c, r, st(Btn::Second), s);
+        let icon = if self.started { "trash" } else { "cancel" };
+        ui::icon(c, icon, r.left + (r.right - r.left - 20.0 * s) / 2.0, r.top + (r.bottom - r.top - 20.0 * s) / 2.0 + dy, 20.0 * s, fg);
+        // 提示：按钮正上方或正下方，夹在窗口里
+        if let Some(b) = self.tip {
+            let (name, key) = self.tip_text(b);
+            let parts: &[(&str, u32)] = if key.is_empty() { &[(name, 0xFFFFFF)] } else { &[(name, 0xFFFFFF), (key, ui::HUD_TEXT2)] };
+            if let Some(h) = Hud::new(parts, s) {
+                let r = if b == Btn::Main { self.main } else { self.second };
+                let x = ((r.left + r.right - h.w) / 2).clamp(0, (self.body.right - h.w).max(0));
+                let g = (6.0 * s).round() as i32;
+                let y = if self.tip_up { self.body.top - g - h.h } else { self.body.bottom + g };
+                h.draw(c, x, y);
+            }
         }
     }
 
@@ -590,7 +650,7 @@ impl Handler for ControlBar {
 mod tests {
     use super::*;
 
-    /// 控制条画在灰底上（倒计时里、录制中鼠标停在「停止」上两种），存成 target/test-tmp/record/bar-*.png。
+    /// 控制条画在灰底上（倒计时里鼠标停在「取消」上、录制中鼠标停在「停止」上并出了提示），存成 target/test-tmp/record/bar-*.png。
     /// 平时不跑：cargo test control_bar_sample -- --ignored
     #[test]
     #[ignore]
@@ -598,10 +658,14 @@ mod tests {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join("test-tmp").join("record");
         std::fs::create_dir_all(&dir).unwrap();
         for started in [false, true] {
-            let (mut bar, w, h) = ControlBar::new(1.5, Arc::new(AtomicU64::new(1_363_149)), Instant::now() + Duration::from_millis(2500), settings::sel_color());
+            let (mut bar, w, mut h) = ControlBar::new(1.5, Arc::new(AtomicU64::new(1_363_149)), Instant::now() + Duration::from_millis(2500), settings::sel_color());
             if started {
                 bar.started = true;
-                bar.hot = Some(Btn::Main);
+                (bar.hot, bar.tip) = (Some(Btn::Main), Some(Btn::Main));
+                h += bar.tip_room(false);
+            } else {
+                bar.hot = Some(Btn::Second);
+                h += bar.tip_room(true);
             }
             let b = plat::Bitmap::new(w, h).unwrap();
             bar.paint(Win::default(), &Canvas::new(&b, b.full(), true));
@@ -711,7 +775,7 @@ mod tests {
         std::fs::write(dir.join(name), plat::encode(&screen.crop(&r), false).unwrap()).unwrap();
     }
 
-    /// 整个流程：框和倒计时出来 → 点「立即开始」→ 录 1 秒 → 停止：边框控制条都关掉，原位置出动图钉图和胶囊。
+    /// 整个流程：框和倒计时出来 → 点「立即开始」→ 录 1 秒 → 停止：边框控制条都关掉，原位置出动图钉图和结果条。
     /// 叠出来的效果图存在 target/test-tmp/record/scene-*.png。会在屏幕上开窗口、截屏，平时不跑：
     /// cargo test record_flow -- --ignored
     #[test]
@@ -755,7 +819,8 @@ mod tests {
         // 动图钉图的图片在原位置，外面那圈框和录制时的边框一样粗
         let f = if settings::get().gif_frame { border(mon.scale()) } else { 0 };
         assert_eq!((pin.rect().left, pin.rect().top), (region.left - f, region.top - f));
-        assert!(!Win::all(plat::Kind::Toast).is_empty(), "没有「录制完成」胶囊");
+        // 时长和大小写在结果条上，录完不弹胶囊
+        assert!(!Win::all(plat::Kind::PinBar).is_empty() && Win::all(plat::Kind::Toast).is_empty(), "该有结果条、没有胶囊");
         // 边框在区域外面，GIF 最上面一行不该是边框的颜色（RGBA、BGRA 都认）
         let mut p = crate::anim::Player::open(&path).unwrap();
         let mut px = vec![0u8; (p.w * p.h * 4) as usize];
@@ -827,7 +892,8 @@ mod tests {
     /// 框满整块屏幕（直接开始，或者从录屏遮罩拖满后按 Enter）：四条边框都贴着屏幕边，不画；控制条压在任务栏上，
     /// 截屏截得到（远程看得到）。控制条底下先垫一块绿色的窗口，录到一半换成橙色：GIF 第一帧那块是绿的、
     /// 最后一帧是橙的——那块是活的画面，不是控制条，也不是开始前冻住的样子（从遮罩来时也不是变暗的遮罩）。
-    /// 会录整块屏幕，平时不跑；两个分开跑（调试版连着跑第二个会卡）：cargo test full_screen_flow -- --ignored --nocapture
+    /// 会录整块屏幕，平时不跑；要用发布版（调试版在 4K 屏上一秒截不到几帧）：
+    /// cargo test --release full_screen -- --ignored --nocapture --test-threads 1
     #[test]
     #[ignore]
     #[cfg(windows)]
@@ -864,7 +930,8 @@ mod tests {
         assert!(inside);
         let (green, orange) = (0x23A55A, 0xF27A1A);
         let pad = Rect { left: spot.left - 30, top: spot.top - 6, right: spot.right + 30, bottom: spot.bottom + 6 };
-        let sw = Win::open(Spec { kind: plat::Kind::Card, rect: pad, title: "Jie 测试色块", owner: None }, Swatch(green)).unwrap();
+        // 用钉图这种窗口：不透明、走 WM_PAINT（卡片现在是透明窗口）
+        let sw = Win::open(Spec { kind: plat::Kind::Pin, rect: pad, title: "Jie 测试色块", owner: None }, Swatch(green)).unwrap();
         let _ = unsafe { windows::Win32::UI::WindowsAndMessaging::ShowWindow(sw.hwnd(), windows::Win32::UI::WindowsAndMessaging::SW_SHOWNOACTIVATE) };
         wait(200);
         let (mon, before) = plat::capture_cursor_monitor().unwrap();
@@ -884,7 +951,9 @@ mod tests {
         // 遮罩上默认不延时：马上开始、没有倒计时；直接开始的这条倒数 3 秒
         assert_eq!(Win::all(plat::Kind::RecFrame).len(), usize::from(!via_overlay), "四条边框都不该画");
         let bar = *Win::all(plat::Kind::RecBar).last().unwrap();
-        let br = bar.rect();
+        // 控制条本体（窗口上下还留着放提示的空白）
+        let (wr, body) = (bar.rect(), bar.peek::<ControlBar>().body);
+        let br = Rect { left: wr.left + body.left, top: wr.top + body.top, right: wr.left + body.right, bottom: wr.top + body.bottom };
         if mon.rect.bottom - mon.work.bottom >= br.bottom - br.top {
             assert!(br.top >= mon.work.bottom, "控制条该压在任务栏上：{br:?}");
         }
@@ -906,7 +975,6 @@ mod tests {
         wait(1200);
         let path = SESSION.with_borrow(|s| s.as_ref().unwrap().path.clone());
         stop();
-        sw.close();
         // 第一帧：和开始前一样（绿的），没有控制条
         let mut p = crate::anim::Player::open(&path).unwrap();
         let mut frame = vec![0u8; (p.w * p.h * 4) as usize];
@@ -924,10 +992,8 @@ mod tests {
         };
         let name = if via_overlay { "gif-first-overlay.png" } else { "gif-first.png" };
         std::fs::write(tmp.join(name), plat::encode(&crop(&frame, p.w), false).unwrap()).unwrap();
-        // 从遮罩来时，遮罩一开一关任务栏会重新压到色块上面，屏幕上本来就看不到色块：只比录完以后的真实屏幕
-        if !via_overlay {
-            assert!(left < 12.0 && near(first, green), "那块不是开始前的样子");
-        }
+        // 色块是钉图这种窗口，从遮罩来时也一直在任务栏上面：第一帧是绿的（不是控制条、也不是变暗的遮罩）
+        assert!(left < 12.0 && near(first, green), "那块不是开始前的样子");
         // 最后一帧：那块跟着变成橙的
         let frames = {
             let mut o = gif::DecodeOptions::new();
@@ -940,16 +1006,8 @@ mod tests {
         }
         let last = mean(&frame, p.w, local);
         println!("GIF 共 {frames} 帧，最后一帧控制条那块平均色 {last:06X}");
-        if via_overlay {
-            // 录完控制条没了：那块的真实屏幕和 GIF 最后一帧一样（不是控制条、不是变暗的遮罩、也不是冻住的旧画面）
-            wait(150);
-            let (_, after) = plat::capture_cursor_monitor().unwrap();
-            let same = diff(after.pixels(), after.w, &frame, p.w, local);
-            println!("GIF 最后一帧那块和录完后的屏幕差 {same:.1}");
-            assert!(same < 15.0, "那块不是真实的画面");
-        } else {
-            assert!(near(last, orange), "控制条底下那块没跟着变：{last:06X}");
-        }
+        assert!(near(last, orange), "控制条底下那块没跟着变（是冻住的旧画面）：{last:06X}");
+        // 色块和录完弹出的结果都是钉图这种窗口，一起关
         for w in Win::all(plat::Kind::Pin) {
             w.close();
         }
@@ -1223,7 +1281,7 @@ mod tests {
         let m = plat::monitor_at(plat::cursor_pos()).work;
         for i in 0..5 {
             let at = Point { x: m.left + 40 + i * 120, y: m.top + 40 + i * 80 };
-            pin::create_gif(path.clone(), at, false).unwrap();
+            pin::create_gif(path.clone(), at, None).unwrap();
         }
         let (c0, t0) = (cpu_time(), Instant::now());
         pump(3000);

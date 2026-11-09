@@ -21,8 +21,13 @@ pub type RectF = D2D_RECT_F;
 pub type Affine = Matrix3x2;
 
 thread_local! {
-    // 系统组件，创建失败说明系统坏了
-    static D2D: ID2D1Factory = unsafe { D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None) }.expect("Direct2D");
+    // 系统组件，创建失败说明系统坏了。多留一个引用永不释放：4K 整屏软件渲染后 D2D 起了工作线程，
+    // 在线程退出时最后一次释放工厂会卡死，之后再建工厂也跟着等死（测试一个线程一个用例时实测）。程序里只有界面线程用，只漏这一个
+    static D2D: ID2D1Factory = {
+        let f: ID2D1Factory = unsafe { D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None) }.expect("Direct2D");
+        std::mem::forget(f.clone());
+        f
+    };
     /// 用完还回来的渲染目标：(保留透明度, 目标)；建一个要几十微秒，重画频繁，留着复用
     static TARGETS: RefCell<Vec<(bool, ID2D1DCRenderTarget)>> = const { RefCell::new(Vec::new()) };
     static ROUND: ID2D1StrokeStyle = unsafe {

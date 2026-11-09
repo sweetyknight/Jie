@@ -1,8 +1,8 @@
-//! 结果胶囊：截图所在显示器工作区底部居中，离底边 48；透明窗口，不抢焦点、鼠标穿透。
+//! 结果胶囊：截图所在显示器工作区底部居中，离底边 48；白底墨色描边、4,4 实心阴影；透明窗口，不抢焦点、鼠标穿透。
 //! 成功停 1.5 秒、失败 4 秒，然后 200ms 淡出；处理中一直转圈，直到被下一条替换。
 
 use crate::plat::{self, Canvas, Color, Event, Face, Handler, Monitor, Rect, Spec, Text, Win};
-use crate::ui::{self, rectf, rgb, rgba};
+use crate::ui::{self, rectf, rgb};
 use std::cell::Cell;
 
 const T_DISMISS: usize = 1;
@@ -10,6 +10,8 @@ const T_FADE: usize = 2;
 const T_SPIN: usize = 3;
 /// 淡出和转圈的帧间隔
 const FRAME_MS: u32 = 16;
+/// 实心阴影 DIP
+const SHADOW: f32 = 4.0;
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Kind {
@@ -41,9 +43,10 @@ pub fn show_action(mon: &Monitor, kind: Kind, text: &str, action: Option<fn()>) 
     }
     let s = mon.scale();
     let Some(text) = Text::wrapped(Face::Ui, 13.0 * s, false, text, ((mon.work.right-mon.work.left) as f32 - 100.0*s).min(600.0*s).max(100.0*s), None) else { return };
-    // 高 36；左内边距 12、右 16；状态图标 16，间距 8
-    let h = (36.0 * s).max(text.height()+18.0*s).ceil() as i32;
-    let w = (12.0 * s + 16.0 * s + 8.0 * s + text.width() + 16.0 * s).ceil() as i32;
+    // 高 40；左内边距 11、右 16；状态方块 18，间距 10；窗口再加上阴影
+    let d = (SHADOW * s).round();
+    let h = ((40.0 * s).max(text.height() + 18.0 * s) + d).ceil() as i32;
+    let w = (11.0 * s + 18.0 * s + 10.0 * s + text.width() + 16.0 * s + d).ceil() as i32;
     let work = mon.work;
     let (x, y) = ((work.left + work.right - w) / 2, work.bottom - (48.0 * s).round() as i32 - h);
     let t = Toast { kind, text, scale: s, angle: 0.0, alpha: 1.0, action };
@@ -91,18 +94,20 @@ impl Handler for Toast {
         let s = self.scale;
         let a = c.area();
         let (w, h) = ((a.right - a.left) as f32, (a.bottom - a.top) as f32);
+        let d = (SHADOW * s).round();
+        let (w, h) = (w - d, h - d);
         c.clear(Color::default());
-        c.fill_round(rectf(0.0, 0.0, w, h), h / 2.0, rgba(0x1C1C1E, 0.92));
-        let (ix, iy) = (12.0 * s, (h - 16.0 * s) / 2.0);
+        ui::block(c, rectf(0.0, 0.0, w, h), 10.0, SHADOW, ui::SURF, s);
+        let (ix, iy) = (11.0 * s, (h - 18.0 * s) / 2.0);
         match self.kind {
             Kind::Ok | Kind::Err => {
-                let (bg, mark) = if self.kind == Kind::Ok { (0x2FB45A, "ok_mark") } else { (0xE5484D, "err_mark") };
-                c.fill_ellipse(ix + 8.0 * s, iy + 8.0 * s, 8.0 * s, 8.0 * s, rgb(bg));
+                let (bg, mark) = if self.kind == Kind::Ok { (ui::OK, "ok_mark") } else { (ui::ERR, "err_mark") };
+                ui::block(c, rectf(ix, iy, ix + 18.0 * s, iy + 18.0 * s), 5.0, 0.0, bg, s);
                 // 状态图标的路径画在 16 网格上，按 20 网格的接口传 20 × s 就是 1 单位 = 1 DIP
-                ui::icon(c, mark, ix, iy, 20.0 * s, rgb(0xFFFFFF));
+                ui::icon(c, mark, ix + 1.0 * s, iy + 1.0 * s, 20.0 * s, rgb(ui::INK));
             }
-            Kind::Busy => ui::spinner(c, ix, iy, s, self.angle, rgba(0xFFFFFF, 0.25), rgb(0xFFFFFF)),
+            Kind::Busy => ui::spinner(c, ix + 1.0 * s, iy + 1.0 * s, s, self.angle, rgb(ui::HOVER), rgb(ui::ACCENT)),
         }
-        c.text(&self.text, ix + 24.0 * s, (h - self.text.height()) / 2.0, rgb(0xFFFFFF));
+        c.text(&self.text, ix + 28.0 * s, (h - self.text.height()) / 2.0, rgb(ui::INK));
     }
 }

@@ -1,15 +1,8 @@
-//! 外壳：启动、托盘菜单、全局快捷键、「已经在运行」的提示。把各功能接起来，功能模块之间不互相调用外壳。
+//! 外壳：启动、托盘面板、全局快捷键、「已经在运行」的提示。把各功能接起来，功能模块之间不互相调用外壳。
 
 use crate::overlay::{self, Mode};
-use crate::plat::{self, MenuItem, Point};
-use crate::{card, hotkeys, pin, record, settings_ui};
-
-const CMD_CAPTURE: usize = 1;
-const CMD_EXIT: usize = 2;
-const CMD_CLOSE_PINS: usize = 3;
-const CMD_CLOSE_CARDS: usize = 4;
-const CMD_SETTINGS: usize = 5;
-const CMD_RECORD: usize = 6;
+use crate::plat::{self, Point};
+use crate::{card, hotkeys, pin, record, settings_ui, tray};
 
 pub const APP: plat::App = plat::App { start, hotkey, tray_click, tray_menu, again, #[cfg(target_os = "macos")] notify };
 
@@ -40,34 +33,31 @@ fn tray_click() {
     hotkey(hotkeys::CAPTURE);
 }
 
+/// 托盘面板（右键托盘图标）：数据从各模块现取，点了什么回到 `tray_cmd`
 fn tray_menu(at: Point) {
-    let (pins, cards) = (pin::count(), card::count());
-    let n = |c: usize| if c > 0 { c.to_string() } else { String::new() };
-    let (np, nc) = (n(pins), n(cards));
-    let (shot, rec) = (hotkeys::label(hotkeys::CAPTURE), hotkeys::label(hotkeys::RECORD));
-    let recording = record::active();
-    let items = [
-        MenuItem { default: true, ..MenuItem::new(CMD_CAPTURE, "截图", &shot) },
-        MenuItem::new(CMD_RECORD, if recording { "停止录屏" } else { "录屏" }, &rec),
-        MenuItem::sep(),
-        MenuItem { enabled: pins > 0, ..MenuItem::new(CMD_CLOSE_PINS, "关闭所有钉图", &np) },
-        MenuItem { enabled: cards > 0, ..MenuItem::new(CMD_CLOSE_CARDS, "关闭所有文字卡片", &nc) },
-        MenuItem::sep(),
-        MenuItem::new(CMD_SETTINGS, "设置", ""),
-        MenuItem::new(CMD_EXIT, "退出", ""),
-    ];
-    match plat::tray_menu(&items, at) {
-        CMD_CAPTURE => hotkey(hotkeys::CAPTURE),
-        CMD_RECORD => hotkey(hotkeys::RECORD),
-        CMD_CLOSE_PINS => pin::close_all(),
-        CMD_CLOSE_CARDS => card::close_all(),
-        CMD_SETTINGS => settings_ui::show(false),
-        CMD_EXIT => {
+    let model = tray::Model {
+        shot_key: hotkeys::label(hotkeys::CAPTURE),
+        rec_key: hotkeys::label(hotkeys::RECORD),
+        recording: record::active(),
+        rec_since: record::started_at(),
+        pins: pin::count(),
+        cards: card::count(),
+    };
+    tray::show(at, model, tray_cmd);
+}
+
+fn tray_cmd(c: tray::Cmd) {
+    match c {
+        tray::Cmd::Capture => hotkey(hotkeys::CAPTURE),
+        tray::Cmd::Record => hotkey(hotkeys::RECORD),
+        tray::Cmd::ClosePins => pin::close_all(),
+        tray::Cmd::CloseCards => card::close_all(),
+        tray::Cmd::Settings => settings_ui::show(false),
+        tray::Cmd::Quit => {
             // 正在录的先放弃，临时文件下次启动清掉
             record::discard();
             plat::quit();
         }
-        _ => {}
     }
 }
 

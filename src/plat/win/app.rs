@@ -188,23 +188,9 @@ pub fn notify(title: &str, text: &str, click: Option<fn()>) {
     let _ = unsafe { Shell_NotifyIconW(NIM_MODIFY, &nid) };
 }
 
-/// 托盘菜单：在屏幕坐标 at 弹出，返回选中的 id，没选为 0
-pub fn tray_menu(items: &[crate::plat::MenuItem], at: POINT) -> usize {
-    let hwnd = main_window();
-    unsafe {
-        // 弹菜单前要把隐藏窗口设成前台，否则点菜单外面菜单不消失；弹完补一条空消息（KB135788）
-        let _ = SetForegroundWindow(hwnd);
-        let cmd = super::popup_menu(hwnd, items, at.x, at.y);
-        let _ = PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0));
-        cmd
-    }
-}
-
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     unsafe {
         match msg {
-            WM_MEASUREITEM if super::menu_measure(lp) => return LRESULT(1),
-            WM_DRAWITEM if super::menu_draw(lp) => return LRESULT(1),
             // NOTIFYICON_VERSION_4：lParam 低位是事件，wParam 是弹菜单的锚点坐标
             WM_TRAY => match lp.0 as u32 & 0xFFFF {
                 NIN_SELECT | NIN_KEYSELECT => (app().tray_click)(),

@@ -1,12 +1,12 @@
 //! 钉图的操作栏窗口：贴在钉图旁边的透明小窗口，画操作栏、工具选项条和工具提示，位置规则同截图。
-//! 编辑标注时是编辑的按钮（主按钮「完成」），录屏结果下面是结果条（主按钮「复制」）。
-//! 不抢焦点，键盘一直在钉图上；透明的地方鼠标穿透。钉图每次变了把编辑器的样子交过来（`place`），点了按钮交回钉图处理。
+//! 用哪组按钮由钉图定：编辑标注、录屏结果、鼠标停在钉图上时的悬停条。
+//! 不抢焦点，键盘一直在钉图上；透明的地方鼠标穿透。钉图每次变了把编辑器的样子交过来（`place`），点了按钮交给建窗口时给的 `act`。
+//! 只依赖 annotate、toolbar、plat、ui，不认识钉图。
 
-use super::Pin;
 use crate::annotate::{Editor, Kind};
 use crate::toolbar::opts::{self, Item, Opts};
 use crate::toolbar::{self, Act, Bar, Items, act_of};
-use crate::plat::{self, Affine, Button, Canvas, Event, Face, Handler, Point, Rect, Spec, Text, Win};
+use crate::plat::{self, Affine, Button, Canvas, Event, Handler, Point, Rect, Spec, Win};
 use crate::ui::{self, Hud};
 
 /// 工具提示：悬停 400ms 后出现
@@ -37,11 +37,11 @@ impl Look {
 
 pub(super) struct Chrome {
     pin: Win,
-    /// 编辑的按钮（PIN）还是录屏结果的（RESULT），主按钮上的字（按 scale 排的）
+    /// 点了按钮：交给钉图
+    act: fn(Win, Btn),
+    /// 哪组按钮；结果条最左边的说明
     items: &'static Items,
-    main: &'static str,
-    label: Text,
-    scale: f32,
+    info: Option<String>,
     look: Look,
     /// 钉图的图片区域（屏幕坐标）
     img: Rect,
@@ -56,20 +56,14 @@ pub(super) struct Chrome {
     origin: Point,
 }
 
-fn label(s: f32, text: &str) -> Option<Text> {
-    Text::new(Face::Ui, 13.0 * s, true, text)
-}
-
-/// 建操作栏窗口（先不显示，第一次 `place` 时出现）；`result`：录屏结果的结果条。归钉图所有：总在钉图上面，钉图关掉时跟着销毁
-pub(super) fn open(pin: Win, result: bool) -> Option<Win> {
-    let scale = pin.scale();
-    let (items, main): (&'static Items, _) = if result { (&toolbar::RESULT, "复制") } else { (&toolbar::PIN, "完成") };
+/// 建操作栏窗口（先不显示，第一次 `place` 时出现）；`info`：最左边写的说明（录屏结果的时长和大小）。
+/// 点了按钮调 `act(pin, 按钮)`。归钉图所有：总在钉图上面，钉图关掉时跟着销毁
+pub(super) fn open(pin: Win, items: &'static Items, info: Option<String>, act: fn(Win, Btn)) -> Option<Win> {
     let c = Chrome {
         pin,
+        act,
         items,
-        main,
-        label: label(scale, main)?,
-        scale,
+        info,
         look: Look::default(),
         img: Rect::default(),
         hot: None,
@@ -81,6 +75,14 @@ pub(super) fn open(pin: Win, result: bool) -> Option<Win> {
         origin: Point::default(),
     };
     Win::open(Spec { kind: plat::Kind::PinBar, rect: Rect::default(), title: "Jie 钉图操作栏", owner: Some(pin) }, c)
+}
+
+/// 换一组按钮（动图暂停、播放），原地重摆
+pub(super) fn set_items(bar: Win, items: &'static Items) {
+    bar.with(|c: &mut Chrome| {
+        c.items = items;
+        c.relayout(bar);
+    });
 }
 
 /// 按钉图的图片区域 `img`（屏幕坐标）和编辑器现在的样子摆好、重画并显示
@@ -105,26 +107,15 @@ impl Chrome {
         (self.img, self.look) = (img, look);
         let mon = plat::monitor_at(Point { x: (img.left + img.right) / 2, y: (img.top + img.bottom) / 2 });
         let s = mon.scale();
-        // 钉图拖到了缩放比例不同的显示器上
-        if s != self.scale
-            && let Some(l) = label(s, self.main)
-        {
-            (self.label, self.scale) = (l, s);
-        }
         // 在工作区里排，坐标相对工作区左上角
         let work = mon.work;
         let (sw, sh) = (work.right - work.left, work.bottom - work.top);
         let px = |dip: f32| (dip * s).round() as i32;
         let anchor = Rect { left: img.left - work.left, top: img.top - work.top, right: img.right - work.left, bottom: img.bottom - work.top };
-        let opt_h = look.opt.map_or(0, |(k, t)| Opts::size(k, t, s).1 + px(4.0));
-        let bar = Bar::layout(anchor, sw, sh, s, self.label.width(), opt_h, self.items);
-        // 选项条：和操作栏左对齐，在操作栏远离钉图的那一侧（操作栏在钉图里面时放它上方），间距 4
-        let opts = look.opt.map(|(kind, trash)| {
-            let (ow, oh) = Opts::size(kind, trash, s);
-            let x = bar.rect.left.min(sw - ow - px(4.0)).max(px(4.0));
-            let y = if bar.below { bar.rect.bottom + px(4.0) } else { bar.rect.top - px(4.0) - oh };
-            Opts::layout(kind, trash, x, y, s)
-        });
+        let opt_h = look.opt.map_or(0, |(k, t)| toolbar::opts_height(k, t, s));
+        let bar = Bar::layout(anchor, sw, sh, s, opt_h, self.items, self.info.as_deref());
+        // 选项条：跟着当前工具，见 `Bar::opts`
+        let opts = look.opt.map(|(kind, trash)| bar.opts(kind, trash, look.tool.and_then(toolbar::tool_of), sw));
         // 提示：按钮下方 6 处、水平居中；下面放不下就放上方
         let hud = self.tip.and_then(|b| {
             let (r, (name, key)) = match b {
@@ -204,8 +195,8 @@ impl Handler for Chrome {
                 if let Some(b) = self.down.take() {
                     self.relayout(w);
                     if self.hot == Some(b) {
-                        let pin = self.pin;
-                        Win::later(move || _ = pin.with(|p: &mut Pin| p.act(pin, b)));
+                        let (pin, act) = (self.pin, self.act);
+                        Win::later(move || act(pin, b));
                     }
                 }
             }
@@ -228,7 +219,7 @@ impl Handler for Chrome {
         let opt_btn = |b: Option<Btn>| if let Some(Btn::Opt(i)) = b { Some(i) } else { None };
         c.set_transform(Affine::translation(-self.origin.x as f32, -self.origin.y as f32));
         if let Some(bar) = &self.bar {
-            bar.draw(c, &self.label, bar_btn(self.hot), bar_btn(self.down), self.look.tool, |a| self.enabled(Btn::Bar(a)));
+            bar.draw(c, bar_btn(self.hot), bar_btn(self.down), self.look.tool, |a| self.enabled(Btn::Bar(a)));
         }
         if let Some(o) = &self.opts {
             o.draw(c, self.look.pen, opt_btn(self.hot), opt_btn(self.down));
