@@ -74,7 +74,8 @@ fn class(kind: Kind) -> PCWSTR {
         Kind::Settings => w!("Jie.Settings"),
         Kind::RecFrame => w!("Jie.RecFrame"),
         Kind::RecBar => w!("Jie.RecBar"),
-        Kind::Tray => w!("Jie.Tray"),
+        // 不能叫 Jie.Tray：那是外壳隐藏主窗口的类（app.rs），重名时面板用了主窗口的过程，一关面板就退出程序
+        Kind::Tray => w!("Jie.TrayPanel"),
     }
 }
 
@@ -204,6 +205,10 @@ impl Win {
                     let _ = ShowWindow(h, SW_SHOWNOACTIVATE);
                 }
                 kind => {
+                    // 透明窗口（托盘面板、文字卡片）先画好再显示：没画过的透明窗口看不见，要等下一次重画（比如鼠标挪动）才出来
+                    if layered(kind) {
+                        render(h);
+                    }
                     let _ = ShowWindow(h, SW_SHOW);
                     if !SetForegroundWindow(h).as_bool() && kind == Kind::Overlay {
                         eprintln!("遮罩没拿到前台");
@@ -230,6 +235,12 @@ impl Win {
     /// 这个线程上开着的某种窗口
     pub fn all(kind: Kind) -> Vec<Win> {
         WINDOWS.with_borrow(|v| v.iter().filter(|w| w.1 == kind).map(|w| Win(w.0)).collect())
+    }
+
+    /// 透明窗口画过没有
+    #[cfg(test)]
+    pub fn drawn(self) -> bool {
+        state(self.hwnd()).is_some_and(|s| s.layer.borrow().is_some())
     }
 
     #[cfg(test)]
@@ -964,6 +975,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
 mod tests {
     use super::*;
     use crate::plat::{Canvas, Event, Handler};
+
+    /// 窗口类名两两不同，也不和外壳隐藏主窗口的重名：重名时后注册的失败，窗口用的是先注册的那个过程
+    #[test]
+    fn class_names_unique() {
+        let kinds = [Kind::Overlay, Kind::Pin, Kind::PinBar, Kind::Card, Kind::Toast, Kind::Settings, Kind::RecFrame, Kind::RecBar, Kind::Tray];
+        let mut names: Vec<String> = kinds.iter().map(|k| unsafe { class(*k).to_string().unwrap() }).collect();
+        names.push(unsafe { super::super::app::TRAY_CLASS.to_string().unwrap() });
+        let n = names.len();
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), n, "窗口类名重名");
+    }
 
     /// 一张空白卡片
     struct Blank;

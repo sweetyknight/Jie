@@ -330,13 +330,20 @@ mod tests {
             std::fs::write(dir.join(name), plat::encode(&out.crop(&out.full()), false).unwrap()).unwrap();
         };
         let at = Point { x: mon.work.right - 100, y: mon.work.bottom + 10 };
+        let t0 = Instant::now();
         show(at, model(true), |c| HIT.store(c as usize, Ordering::Relaxed));
+        println!("弹出面板（建窗口 + 画好）{:.1} ms", t0.elapsed().as_secs_f64() * 1000.0);
         let w = OPEN.get().expect("面板没出来");
+        // show 完当场就画好了，不等鼠标挪上去
+        #[cfg(windows)]
+        assert!(w.drawn(), "面板显示了但没画");
         assert!(w.rect().bottom <= mon.work.bottom && w.rect().right <= mon.work.right);
         snap(w, "recording.png");
         w.close();
 
+        let t1 = Instant::now();
         show(at, model(false), |c| HIT.store(c as usize, Ordering::Relaxed));
+        println!("第二次弹出面板 {:.1} ms", t1.elapsed().as_secs_f64() * 1000.0);
         let w = OPEN.get().unwrap();
         let key = |k: Key| w.send(Event::Key { key: k, mods: plat::Mods::default() });
         // 截图、录屏、钉图的「全部关闭」，文字卡片那行置灰跳过，到设置

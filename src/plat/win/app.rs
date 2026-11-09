@@ -18,7 +18,7 @@ const WM_TRAY: u32 = WM_APP + 1;
 const WM_RUN: u32 = WM_APP + 2;
 /// 又启动了一个 Jie，新进程发给已在运行的这个
 const WM_AGAIN: u32 = WM_APP + 3;
-const TRAY_CLASS: PCWSTR = w!("Jie.Tray");
+pub(super) const TRAY_CLASS: PCWSTR = w!("Jie.Tray");
 const NIN_KEYSELECT: u32 = NIN_SELECT | NINF_KEY;
 
 type Job = Box<dyn FnOnce() + Send>;
