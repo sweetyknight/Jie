@@ -7,13 +7,14 @@
 //! 悬停条第一个按钮是暂停/播放。
 //! 刚录完时是「结果」状态：下面挂结果条（复制、保存、钉住、丢弃），复制或保存以后就关掉，钉住以后是普通的动图钉图。
 //! 钉图不知道录屏：录屏只管把文件交过来（`create_gif`）。
+//! 长截图按设置缩小显示全图，或保持原选区大小滚动查看；两种方式都保留完整原图用于编辑、复制和保存。
 
 mod bar;
 
 use crate::anim::Player;
 use crate::annotate::{Doc, Editor, Pt};
 use crate::image_io;
-use crate::plat::{self, Affine, Bitmap, Button, Canvas, Cursor, Event, Handler, Image, Key, MenuItem, Mods, Point, Rect, Spec, Win};
+use crate::plat::{self, Affine, Bitmap, Button, Canvas, Cursor, Event, Handler, Image, Key, MenuItem, Mods, Monitor, Point, Rect, Spec, Win};
 use crate::toast::{self, Kind};
 use crate::toolbar::{self, Act, Items, opts::Item, tool_of};
 use crate::ui::{self, Hud, rectf};
@@ -25,6 +26,9 @@ const HUD_TIMER: usize = 1;
 const ANIM_TIMER: usize = 2;
 /// 鼠标离开钉图后隔一会儿看还在不在钉图或悬停条上
 const HOVER_TIMER: usize = 3;
+
+/// 编辑时图片外的描边至少这么粗（像素）
+const EDIT_BORDER: i32 = 2;
 
 const CMD_EDIT: usize = 1;
 const CMD_OCR: usize = 2;
@@ -50,7 +54,7 @@ struct Pin {
     ed: Editor,
     /// 缩小时显示用的图：(对应的缩放百分比, 图)
     view: Option<(i32, Bitmap)>,
-    /// 缩放百分比 10–500，不透明度百分比 20–100
+    /// 缩放百分比 1–500，不透明度百分比 20–100
     zoom: i32,
     opacity: i32,
     hud: Option<String>,
@@ -63,10 +67,14 @@ struct Pin {
     hovering: bool,
     /// 动图钉图
     anim: Option<Anim>,
-    /// 录屏结果：下面挂着结果条
+    /// 录屏或长截图结果：下面挂着结果条
     preview: bool,
-    /// 动图钉图外面那圈框的粗细（像素，设置里关了是 0）；建好就定下，改设置不影响已经开着的
+    /// 静态钉图外面那圈框的粗细（像素，设置里关了是 0；动图的框编在 GIF 里，这里是 0）；建好就定下，改设置不影响已经开着的
     frame: i32,
+    /// 长图滚动模式的窗口内高度（物理像素）；None 沿用整图缩放
+    viewport: Option<i32>,
+    /// 图片在窗口内的纵向偏移（显示像素），不裁掉原图
+    scroll_y: i32,
 }
 
 /// 动图：播放器（帧画在 `img` 上）、GIF 文件、是不是在播
@@ -76,11 +84,15 @@ struct Anim {
     playing: bool,
 }
 
-fn open(img: Bitmap, at: Point, ed: Editor, anim: Option<Anim>, preview: bool) -> Option<Win> {
-    let (w, h) = (img.w, img.h);
-    // 和录制时的边框一样粗（3 DIP），录完框还在原来的位置
-    let frame = if anim.is_some() && crate::settings::get().gif_frame { (3.0 * plat::monitor_at(at).scale()).round().max(2.0) as i32 } else { 0 };
-    let pin = Pin { img, ed, view: None, zoom: 100, opacity: 100, hud: None, wheel_acc: 0, drag: Drag::None, chrome: None, hovering: false, anim, preview, frame };
+/// 按缩放百分比 `zoom` 显示（不是 100 时一开始就缩好）
+fn open(img: Bitmap, at: Point, mut ed: Editor, anim: Option<Anim>, preview: bool, zoom: i32, viewport: Option<i32>) -> Option<Win> {
+    let f = |v: i32| ((v * zoom + 50) / 100).max(1);
+    let (w, ih) = (f(img.w), f(img.h));
+    let h = ih.min(viewport.unwrap_or(ih).max(1));
+    let frame = if anim.is_some() { 0 } else { shot_frame(plat::monitor_at(at)) };
+    let view = if zoom < 100 { plat::scale_down(&img, w, ih).map(|v| (zoom, v)) } else { None };
+    ed.zoom = zoom as f32 / 100.0;
+    let pin = Pin { img, ed, view, zoom, opacity: 100, hud: None, wheel_acc: 0, drag: Drag::None, chrome: None, hovering: false, anim, preview, frame, viewport, scroll_y: 0 };
     // 图片左上角在 `at`，框画在外面
     let rect = Rect { left: at.x - frame, top: at.y - frame, right: at.x + w + frame, bottom: at.y + h + frame };
     let win = Win::open(Spec { kind: plat::Kind::Pin, rect, title: "Jie 钉图", owner: None }, pin)?;
@@ -88,9 +100,45 @@ fn open(img: Bitmap, at: Point, ed: Editor, anim: Option<Anim>, preview: bool) -
     Some(win)
 }
 
+/// 截图边框的粗细（设置里关了是 0）：和录制时的边框一样粗
+fn shot_frame(mon: Monitor) -> i32 {
+    let st = crate::settings::get();
+    st.frame_px(mon.scale(), st.shot_frame)
+}
+
 /// 新建钉图；`at` 是图片左上角的屏幕坐标，`ed` 带着截图时画的标注
 pub fn create(img: Bitmap, at: Point, ed: Editor) {
-    open(img, at, ed, None, false);
+    open(img, at, ed, None, false, 100, None);
+}
+
+/// 长截图结果：按设置显示整图，或用原截图区域 `region` 的大小滚动查看，原图像素始终保留。
+/// 下面挂结果条（复制、保存、钉住、丢弃），最左边写 `info`
+pub fn create_result(img: Bitmap, region: Rect, info: String) {
+    let at = Point { x: region.left, y: region.top };
+    let mon = plat::monitor_at(at);
+    let viewport = crate::settings::get().longshot_scroll.then_some((region.bottom - region.top).max(1));
+    let (at, zoom) = if viewport.is_some() { (at, 100) } else { result_layout((img.w, img.h), at, mon, shot_frame(mon)) };
+    let Some(win) = open(img, at, Editor::new(Doc::default(), mon.scale()), None, true, zoom, viewport) else { return };
+    win.with(|p: &mut Pin| {
+        p.show_result(win, info);
+        if viewport.is_some() {
+            p.show_hud(win, "上下滚动查看".into());
+        } else if zoom < 100 {
+            p.show_hud(win, format!("{zoom}%"));
+        }
+    });
+}
+
+/// 长图初始布局：图片连同外面 `b` 像素的框，宽高都不能超出工作区，底下留够结果条的位置。
+fn result_layout((iw, ih): (i32, i32), at: Point, mon: Monitor, b: i32) -> (Point, i32) {
+    let (wk, s) = (mon.work, mon.scale());
+    // 结果条 48 + 间距 8 + 阴影 4，再留一点
+    let room = (wk.bottom - wk.top - (64.0 * s).round() as i32 - 2 * b).max(1);
+    // 最长 30000 行在普通屏幕上需要低于 10%，不能沿用普通钉图的旧下限。
+    let zoom = (room * 100 / ih).min((wk.right - wk.left - 2 * b).max(1) * 100 / iw).clamp(1, 100);
+    let f = |v: i32| ((v * zoom + 50) / 100).max(1);
+    let (w, h) = (f(iw), f(ih));
+    (Point { x: at.x.min(wk.right - b - w).max(wk.left + b), y: at.y.min(wk.top + b + room - h).max(wk.top + b) }, zoom)
 }
 
 /// 动图钉图：GIF 文件 `path` 钉在 `at`（屏幕坐标）开始循环播放；`result` 有值时是录屏结果，下面挂结果条，
@@ -101,7 +149,7 @@ pub fn create_gif(path: PathBuf, at: Point, result: Option<String>) -> Result<()
     let mut img = Bitmap::new(player.w, player.h).ok_or("内存不够，打不开动图")?;
     let delay = player.next(img.pixels_mut())?;
     let ed = Editor::new(Doc::default(), plat::monitor_at(at).scale());
-    let win = open(img, at, ed, Some(Anim { player, path, playing: true }), preview).ok_or("打不开动图窗口")?;
+    let win = open(img, at, ed, Some(Anim { player, path, playing: true }), preview, 100, None).ok_or("打不开动图窗口")?;
     win.timer(ANIM_TIMER, delay.as_millis().max(10) as u32);
     if let Some(info) = result {
         win.with(|p: &mut Pin| p.show_result(win, info));
@@ -152,29 +200,40 @@ impl Pin {
         (f(self.img.w), f(self.img.h))
     }
 
+    /// 窗口内可见尺寸；滚动模式只限制视口，原图尺寸、导出范围不变。
+    fn visible(&self) -> (i32, i32) {
+        let (w, h) = self.shown();
+        (w, h.min(self.viewport.unwrap_or(h).max(1)))
+    }
+
     /// 在编辑标注（录屏结果、悬停条不算）
     fn editing(&self) -> bool {
         self.chrome.is_some() && !self.preview && !self.hovering
     }
 
-    /// 图片外的选区色描边：编辑时 2px；动图按设置一直有框（见 `frame`）；平时没有
+    /// 图片外的选区色描边：截图边框（见 `frame`），编辑时至少 2px
     fn border(&self) -> i32 {
-        if self.editing() { 2 } else { self.frame }
+        if self.editing() { self.frame.max(EDIT_BORDER) } else { self.frame }
+    }
+
+    /// 进出编辑时窗口每边要扩、缩多少
+    fn edit_pad(&self) -> i32 {
+        EDIT_BORDER - self.frame.min(EDIT_BORDER)
     }
 
     fn to_img(&self, p: Point) -> Pt {
-        to_img(p, self.border(), self.zoom)
+        to_img(Point { y: p.y + self.scroll_y, ..p }, self.border(), self.zoom)
     }
 
     /// 原图像素 → 客户区（放候选窗、重画输入框用）
     fn client_of(&self) -> impl Fn(Pt) -> Pt + use<> {
-        let (k, b) = (self.zoom as f32 / 100.0, self.border() as f32);
-        move |p| Pt::new(p.x * k + b, p.y * k + b)
+        let (k, b, y) = (self.zoom as f32 / 100.0, self.border() as f32, self.scroll_y as f32);
+        move |p| Pt::new(p.x * k + b, p.y * k + b - y)
     }
 
     /// 客户区的点在不在图片上
     fn inside(&self, p: Point) -> bool {
-        let ((iw, ih), b) = (self.shown(), self.border());
+        let ((iw, ih), b) = (self.visible(), self.border());
         p.x >= b && p.x < b + iw && p.y >= b && p.y < b + ih
     }
 
@@ -188,7 +247,7 @@ impl Pin {
     fn hud(&self, w: Win) -> Option<(Hud, Rect)> {
         let s = w.scale();
         let hud = Hud::readout(&[(self.hud.as_deref()?, ui::INK)], s)?;
-        let ((iw, ih), b) = (self.shown(), self.border());
+        let ((iw, ih), b) = (self.visible(), self.border());
         let g = (8.0 * s).round() as i32;
         let (x, y) = (b + iw - g - hud.w, b + ih - g - hud.h);
         let r = Rect { left: x, top: y, right: x + hud.w, bottom: y + hud.h };
@@ -197,7 +256,7 @@ impl Pin {
 
     /// 画描边和图片，原点挪到 (ox, oy)
     fn draw_body(&self, c: &Canvas, ox: i32, oy: i32) {
-        let ((iw, ih), b) = (self.shown(), self.border());
+        let ((iw, ih), b) = (self.visible(), self.border());
         let editing = self.editing();
         let color = crate::settings::sel_color();
         // 描边一圈一圈从外往里画
@@ -205,11 +264,14 @@ impl Pin {
             ui::frame_px(c, Rect { left: i - ox, top: i - oy, right: iw + 2 * b - i - ox, bottom: ih + 2 * b - i - oy }, color);
         }
         let (x, y) = (b - ox, b - oy);
+        // 图片和标注共用视口裁剪，不能画到窗口边框上；纵向偏移只影响显示。
+        let image_y = y - self.scroll_y;
+        c.push_clip(rectf(x as f32, y as f32, (x + iw) as f32, (y + ih) as f32));
         match &self.view {
-            _ if self.zoom == 100 => c.blit(&self.img, self.img.full(), x, y),
-            Some((z, v)) if *z == self.zoom => c.blit(v, v.full(), x, y),
+            _ if self.zoom == 100 => c.blit(&self.img, Rect { top: self.scroll_y, bottom: self.scroll_y + ih, ..self.img.full() }, x, y),
+            Some((z, v)) if *z == self.zoom => c.blit(v, v.full(), x, image_y),
             // 放大：最近邻，像素清楚；缩小图还没做出来时也先这样顶着
-            _ => c.blit_scaled(&self.img, Rect { left: x, top: y, right: x + iw, bottom: y + ih }),
+            _ => c.blit_scaled(&self.img, Rect { left: x, top: image_y, right: x + iw, bottom: image_y + self.shown().1 }),
         }
         // 标注按缩放叠上去，裁在图片里；只画看得见的那块，放大到 500% 也不会分配整张大图。编辑时带选中框和正在输入的文字
         let a = c.area();
@@ -217,18 +279,19 @@ impl Pin {
         if (!self.ed.doc.anns.is_empty() || self.ed.text.is_some()) && r.right > r.left && r.bottom > r.top {
             let k = self.zoom as f32 / 100.0;
             c.push_clip(rectf(r.left as f32, r.top as f32, r.right as f32, r.bottom as f32));
-            c.set_transform(Affine { M11: k, M12: 0.0, M21: 0.0, M22: k, M31: x as f32, M32: y as f32 });
+            c.set_transform(Affine { M11: k, M12: 0.0, M21: 0.0, M22: k, M31: x as f32, M32: image_y as f32 });
             self.ed.draw(c, &self.img, editing.then(crate::settings::sel_color));
             c.set_transform(Affine::identity());
             c.pop_clip();
         }
+        c.pop_clip();
     }
 
-    /// 导出用：原图连同标注
+    /// 导出用：原图连同标注，外面加上钉图上那圈框
     fn export(&self) -> Option<Image> {
         let out = self.img.sub(&self.img.full())?;
         self.ed.burn(&out, 0, 0, &self.img);
-        Some(out.crop(&out.full()))
+        Some(out.crop(&out.full()).framed(self.frame, crate::settings::sel_color()))
     }
 
     fn show_hud(&mut self, w: Win, text: String) {
@@ -239,7 +302,8 @@ impl Pin {
 
     /// 缩放到 zoom%，`anchor`（屏幕坐标）下的那个像素保持不动
     fn set_zoom(&mut self, w: Win, zoom: i32, anchor: Point) {
-        let zoom = zoom.clamp(10, 500);
+        // 和长图初始缩放共用下限，避免向下滚轮反而把低于 10% 的长图放大。
+        let zoom = zoom.clamp(1, 500);
         let (wr, b) = (w.rect(), self.border());
         let (ix, iy) = (wr.left + b, wr.top + b);
         let k = zoom as f32 / self.zoom as f32;
@@ -249,13 +313,18 @@ impl Pin {
         let (iw, ih) = self.shown();
         // 缩小时换一张高质量缩小的显示图；放大和 100% 直接用原图
         self.view = if zoom < 100 { plat::scale_down(&self.img, iw, ih).map(|v| (zoom, v)) } else { None };
-        w.set_rect(Rect { left: nx - b, top: ny - b, right: nx - b + iw + 2 * b, bottom: ny - b + ih + 2 * b });
+        self.scroll_y = self.scroll_y.min((ih - self.visible().1).max(0));
+        w.set_rect(Rect { left: nx - b, top: ny - b, right: nx - b + iw + 2 * b, bottom: ny - b + self.visible().1 + 2 * b });
         self.show_hud(w, format!("{zoom}%"));
         self.ed.zoom = zoom as f32 / 100.0;
         self.place_bar(w);
     }
 
     fn wheel(&mut self, w: Win, delta: i32, p: Point, mods: Mods) {
+        // 触控板的小步滚动直接作用于视口；修饰键调透明度仍沿用普通钉图的行为。
+        if self.viewport.is_some() && !mods.cmd {
+            return self.scroll_by(w, (-(delta as f32) * w.scale() / 2.0).round() as i32);
+        }
         self.wheel_acc += delta;
         let notches = self.wheel_acc / 120;
         if notches == 0 {
@@ -274,23 +343,31 @@ impl Pin {
         }
     }
 
+    /// 上下边界夹住，不改变窗口大小；复制、保存始终使用完整原图。
+    fn scroll_by(&mut self, w: Win, delta: i32) {
+        self.update(w, |p| p.ed.finish_text());
+        let h = self.visible().1;
+        self.scroll_y = self.scroll_y.saturating_add(delta).clamp(0, self.shown().1 - h);
+        w.ime(self.ed.caret(self.client_of()));
+        self.show_hud(w, format!("{}–{} / {}", self.scroll_y + 1, self.scroll_y + h, self.shown().1));
+    }
+
     fn copy(&mut self, w: Win) {
-        // 动图复制的是文件；录屏结果复制完就关掉，和截图一样
-        if let Some(a) = &self.anim {
-            match plat::copy_file(&a.path) {
-                Ok(()) => toast::show(&w.monitor(), Kind::Ok, &format!("已复制 GIF（{}）", size_text(&a.path))),
-                Err(e) => toast::show(&w.monitor(), Kind::Err, &format!("复制失败：{e}")),
+        // 动图复制文件，静态图复制原始像素；两者都只在成功后关闭结果。
+        let result = if let Some(a) = &self.anim {
+            plat::copy_file(&a.path).map(|()| format!("已复制 GIF（{}）", size_text(&a.path)))
+        } else {
+            self.update(w, |s| s.ed.finish_text());
+            let Some(img) = self.export() else { return };
+            plat::copy_image(&img).map(|()| format!("已复制 {} × {}", img.w, img.h))
+        };
+        match result {
+            Ok(info) => {
+                toast::show(&w.monitor(), Kind::Ok, &info);
+                if self.preview {
+                    w.close();
+                }
             }
-            if self.preview {
-                w.close();
-            }
-            return;
-        }
-        // 正在输入的文字先提交
-        self.update(w, |s| s.ed.finish_text());
-        let Some(img) = self.export() else { return };
-        match plat::copy_image(&img) {
-            Ok(()) => toast::show(&w.monitor(), Kind::Ok, &format!("已复制 {} × {}", img.w, img.h)),
             Err(e) => toast::show(&w.monitor(), Kind::Err, &format!("复制失败：{e}")),
         }
     }
@@ -310,7 +387,11 @@ impl Pin {
         for i in 0..l0.len().max(l1.len()) {
             if l0.get(i) != l1.get(i) {
                 for (r, ..) in [l0.get(i), l1.get(i)].into_iter().flatten() {
-                    w.invalidate(to_client(*r, b, z));
+                    // 标注的脏区同样减去滚动偏移，避免在原位置留下残影。
+                    let mut r = to_client(*r, b, z);
+                    r.top -= self.scroll_y;
+                    r.bottom -= self.scroll_y;
+                    w.invalidate(r);
                 }
             }
         }
@@ -375,14 +456,14 @@ impl Pin {
         }
     }
 
-    /// 进入编辑：悬停条换成编辑的操作栏；窗口往外扩 2px 画描边、图片不动
+    /// 进入编辑：悬停条换成编辑的操作栏；描边不够 2px 时窗口往外扩、图片不动
     fn enter_edit(&mut self, w: Win) {
         self.unhover();
         if self.chrome.is_some() || self.anim.is_some() {
             return;
         }
-        let r = w.rect();
-        w.set_rect(Rect { left: r.left - 2, top: r.top - 2, right: r.right + 2, bottom: r.bottom + 2 });
+        let (r, d) = (w.rect(), self.edit_pad());
+        w.set_rect(Rect { left: r.left - d, top: r.top - d, right: r.right + d, bottom: r.bottom + d });
         w.invalidate_all();
         self.open_bar(w, &toolbar::PIN, None);
     }
@@ -462,8 +543,8 @@ impl Pin {
         }
         w.ime(None);
         c.close();
-        let r = w.rect();
-        w.set_rect(Rect { left: r.left + 2, top: r.top + 2, right: r.right - 2, bottom: r.bottom - 2 });
+        let (r, d) = (w.rect(), self.edit_pad());
+        w.set_rect(Rect { left: r.left + d, top: r.top + d, right: r.right - d, bottom: r.bottom - d });
         w.invalidate_all();
     }
 
@@ -586,16 +667,20 @@ impl Pin {
     }
 
     fn save(&mut self, w: Win) {
-        // 动图把 GIF 文件拷过去；录屏结果选好位置就关掉，和截图一样
-        if let Some(a) = &self.anim {
-            let (src, preview) = (a.path.clone(), self.preview);
-            return image_io::ask_save_gif(w, move |dst| {
-                if preview {
+        // 保存模块只负责写文件；成功后仍处于结果状态才关窗口，失败保留原图。
+        let done = move || {
+            w.with(|p: &mut Pin| {
+                if p.preview {
                     w.close();
                 }
+            });
+        };
+        if let Some(a) = &self.anim {
+            let src = a.path.clone();
+            return image_io::ask_save_gif(w, move |dst| {
                 let mon = w.monitor();
                 toast::show(&mon, Kind::Busy, "正在保存…");
-                image_io::copy_async(src, dst, mon);
+                image_io::copy_async(src, dst, mon, done);
             });
         }
         // 正在输入的文字先提交，对话框后面看到的就是存下来的样子
@@ -604,7 +689,7 @@ impl Pin {
         image_io::ask_save(w, move |path| {
             let mon = w.monitor();
             toast::show(&mon, Kind::Busy, "正在保存…");
-            image_io::save_async(img, path, mon);
+            image_io::save_async(img, path, mon, done);
         });
     }
 }
@@ -626,6 +711,11 @@ impl Handler for Pin {
             Event::Timer(ANIM_TIMER) => self.tick(w),
             Event::Timer(HOVER_TIMER) => self.hover_check(w),
             Event::Leave if self.hovering => w.timer(HOVER_TIMER, 300),
+            // 结果条和普通钉图都能用方向键浏览，键盘用户不必使用滚轮。
+            Event::Key { key: key @ (Key::Up | Key::Down | Key::Home | Key::End), .. } if self.viewport.is_some() && !editing => {
+                let step = (40.0 * w.scale()).round() as i32;
+                self.scroll_by(w, match key { Key::Up => -step, Key::Home => i32::MIN, Key::End => i32::MAX, _ => step });
+            }
             // 录屏结果：双击复制（和截图一样），按键都是结果条上的快捷键
             Event::Down { button: Button::Left, double: true, .. } if self.preview => self.copy(w),
             Event::Key { key, mods } if self.preview => match key {
@@ -715,6 +805,97 @@ mod tests {
         // 原图范围 → 客户区：乘缩放加描边，向外取整再多留 1
         assert_eq!(to_client(Rect { left: 100, top: 50, right: 111, bottom: 60 }, 2, 150), Rect { left: 151, top: 76, right: 170, bottom: 93 });
         assert_eq!(to_client(Rect { left: 100, top: 50, right: 110, bottom: 60 }, 1, 50), Rect { left: 50, top: 25, right: 57, bottom: 32 });
+    }
+
+    /// 截图边框：编辑时描边取框和 2px 里粗的，窗口只扩差的那点；导出的图带框
+    #[test]
+    fn frame_when_editing_and_export() {
+        for (f, b, d) in [(0, 2, 2), (1, 2, 1), (3, 3, 0)] {
+            let mut p = Pin { img: Bitmap::new(4, 3).unwrap(), ed: Editor::new(Doc::default(), 1.0), view: None, zoom: 100, opacity: 100, hud: None,
+                wheel_acc: 0, drag: Drag::None, chrome: None, hovering: false, anim: None, preview: false, frame: f, viewport: None, scroll_y: 0 };
+            assert_eq!(p.border(), f);
+            p.chrome = Some(Win::default());
+            assert_eq!((p.border(), p.edit_pad()), (b, d));
+            let img = p.export().unwrap();
+            assert_eq!((img.w, img.h), (4 + 2 * f, 3 + 2 * f));
+        }
+    }
+
+    #[test]
+    fn long_result_fits_work_area() {
+        let work = Rect { left: -1920, top: 0, right: 0, bottom: 1040 };
+        let mon = Monitor { rect: work, work, dpi: 96 };
+        // 最长图、宽图，以及选区原本靠屏幕底边时，都要给结果条留位置。
+        // 外面有框（b）时连框一起放进去，贴着工作区左上角也不出屏
+        for b in [0, 3] {
+            for ((iw, ih), at) in [((1200, 30_000), Point { x: -600, y: 900 }), ((3000, 1000), Point { x: -600, y: 900 }), ((400, 800), Point { x: -600, y: 900 }), ((300, 200), Point { x: -1920, y: 0 })] {
+                let (at, zoom) = result_layout((iw, ih), at, mon, b);
+                let (w, h) = (((iw * zoom + 50) / 100).max(1), ((ih * zoom + 50) / 100).max(1));
+                assert!(at.x - b >= work.left && at.x + w + b <= work.right, "{b} {iw}×{ih}");
+                assert!(at.y - b >= work.top && at.y + h + b + 64 <= work.bottom, "{b} {iw}×{ih}");
+            }
+        }
+        assert_eq!(result_layout((1200, 30_000), Point::default(), mon, 0).1, 3);
+    }
+
+    #[test]
+    fn scroll_view_keeps_full_image_and_coordinates() {
+        let mut img = Bitmap::new(120, 1000).unwrap();
+        for (i, px) in img.pixels_mut().chunks_exact_mut(4).enumerate() {
+            let y = (i / 120) as u32;
+            px.copy_from_slice(&[y as u8, (y >> 8) as u8, 90, 255]);
+        }
+        let expected = img.pixels().to_vec();
+        let p = Pin { img, ed: Editor::new(Doc::default(), 1.0), view: None, zoom: 100, opacity: 100, hud: None,
+            wheel_acc: 0, drag: Drag::None, chrome: None, hovering: false, anim: None, preview: false, frame: 0, viewport: Some(200), scroll_y: 500 };
+        // 窗口坐标带上滚动偏移，标注、候选窗和命中测试都不能落到原图错误的行上。
+        assert_eq!(p.visible(), (120, 200));
+        assert_eq!(p.to_img(Point { x: 10, y: 20 }), Pt::new(10.0, 520.0));
+        assert_eq!(p.client_of()(Pt::new(10.0, 520.0)), Pt::new(10.0, 20.0));
+        assert!(p.inside(Point { x: 10, y: 199 }));
+        assert!(!p.inside(Point { x: 10, y: 200 }));
+        let out = p.export().unwrap();
+        assert_eq!((out.w, out.h), (120, 1000));
+        assert_eq!(out.px, expected, "导出不能只剩窗口内的 200 行");
+        let view = Bitmap::new(120, 200).unwrap();
+        p.draw_body(&Canvas::new(&view, view.full(), false), 0, 0);
+        assert_eq!(view.pixels(), &expected[500 * 120 * 4..700 * 120 * 4], "显示区域必须是当前滚动位置的像素");
+    }
+
+    /// 只创建自己的测试钉图；验证滚轮、触控板小步、键盘、编辑坐标和窗口大小，不控制外部应用。
+    #[test]
+    #[ignore]
+    fn long_scroll_view() {
+        let mon = plat::monitor_at(Point::default());
+        let at = Point { x: mon.work.left + 300, y: mon.work.top + 200 };
+        let mut img = Bitmap::new(360, 1400).unwrap();
+        img.pixels_mut().fill(255);
+        let w = open(img, at, Editor::new(Doc::default(), mon.scale()), None, true, 100, Some(300)).unwrap();
+        let r = w.rect();
+        let p = w.peek::<Pin>();
+        w.send(Event::Wheel { delta: -1, p: at, mods: Mods::default() });
+        assert!(p.scroll_y > 0 && p.zoom == 100, "触控板小步应滚图而不是缩放");
+        key(w, Key::End);
+        assert_eq!(p.scroll_y, 1100);
+        assert_eq!(w.rect(), r);
+        let offset = p.scroll_y;
+        w.send(Event::Wheel { delta: -120, p: at, mods: Mods { cmd: true, ..Mods::default() } });
+        assert_eq!((p.scroll_y, p.opacity), (offset, 90));
+        w.with(|p: &mut Pin| { p.keep(w); p.enter_edit(w); p.ed.set_tool(Tool::Rect); });
+        let b = p.border();
+        drag(w, (b + 10, b + 20), (b + 90, b + 70));
+        assert_eq!(p.ed.doc.anns[0].shape, Shape::Rect(Pt::new(10.0, 1120.0), Pt::new(90.0, 1170.0)));
+        assert_eq!((p.export().unwrap().w, p.export().unwrap().h), (360, 1400));
+        shot(w, "long-scroll-edit.png");
+        w.with(|p: &mut Pin| p.exit_edit(w));
+        key(w, Key::Home);
+        assert_eq!(p.scroll_y, 0);
+        w.send(Event::Wheel { delta: i32::MAX, p: at, mods: Mods::default() });
+        assert_eq!(p.scroll_y, 0);
+        w.send(Event::Wheel { delta: i32::MIN, p: at, mods: Mods::default() });
+        assert_eq!(p.scroll_y, 1100);
+        assert_eq!(w.rect(), r);
+        w.close();
     }
 
     fn mouse(w: Win, e: fn(Point) -> Event, x: i32, y: i32) {
@@ -872,7 +1053,7 @@ mod tests {
         let w = *Win::all(plat::Kind::Pin).last().expect("钉图没出来");
         let s = w.peek::<Pin>();
         mouse(w, mv, 100, 100);
-        assert!(s.hovering && s.chrome.is_some() && !s.editing() && s.border() == 0);
+        assert!(s.hovering && s.chrome.is_some() && !s.editing() && s.border() == s.frame);
         let bar = s.chrome.unwrap();
         let r = bar.peek::<bar::Chrome>().button(Btn::Bar(Act::Translate));
         mouse(bar, mv, (r.left + r.right) / 2, (r.top + r.bottom) / 2);
@@ -908,11 +1089,10 @@ mod tests {
         let w = *Win::all(plat::Kind::Pin).last().expect("动图钉图没出来");
         let s = w.peek::<Pin>();
         assert!(s.preview && s.chrome.is_some() && s.anim.is_some());
-        // 图片左上角在 at，外面一圈框（默认开，和录制时的边框一样粗）
-        let f = s.frame;
-        assert_eq!(f, (3.0 * mon.scale()).round().max(2.0) as i32);
-        assert_eq!(w.rect(), Rect { left: at.x - f, top: at.y - f, right: at.x + 120 + f, bottom: at.y + 80 + f });
-        assert_eq!(s.image_rect(w), Rect { left: at.x, top: at.y, right: at.x + 120, bottom: at.y + 80 });
+        // 图片左上角在 at；动图的框编在 GIF 文件里，钉图自己不再画
+        assert_eq!(s.frame, 0);
+        assert_eq!(w.rect(), Rect { left: at.x, top: at.y, right: at.x + 120, bottom: at.y + 80 });
+        assert_eq!(s.image_rect(w), w.rect());
         assert_eq!(s.img.pixels()[0], 0x30);
         // 定时器到了：换成第二帧
         w.send(Event::Timer(ANIM_TIMER));

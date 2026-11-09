@@ -28,6 +28,20 @@ pub fn cursor_pos() -> POINT {
     p
 }
 
+/// 往屏幕上 `at` 下面的窗口发一次滚轮（`delta`：一格 120，往上为正），不挪鼠标。
+/// 直接投递 WM_MOUSEWHEEL：不用那个窗口在前台，也不用鼠标停在那里
+pub fn scroll(at: POINT, delta: i32) -> Result<(), String> {
+    unsafe {
+        let h = WindowFromPoint(at);
+        if h.is_invalid() {
+            return Err("那里没有窗口".into());
+        }
+        let wp = WPARAM((delta.clamp(-32768, 32767) as i16 as u16 as usize) << 16);
+        let lp = LPARAM(((at.y as i16 as u16 as isize) << 16) | at.x as i16 as u16 as isize);
+        PostMessageW(Some(h), WM_MOUSEWHEEL, wp, lp).map_err(|e| e.message())
+    }
+}
+
 /// 截鼠标所在的显示器
 pub fn capture_cursor_monitor() -> Option<(Monitor, Bitmap)> {
     unsafe {

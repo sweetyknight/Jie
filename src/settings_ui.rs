@@ -4,7 +4,7 @@
 
 use crate::plat::{self, Button, Canvas, Cursor, Event, Face, FieldKind, Handler, Key, MenuItem, Point, Rect, RectF, Spec, Stroke, Text, Win};
 use crate::hotkeys;
-use crate::settings::{self, FPS_CHOICES, Format, Hotkey, Settings};
+use crate::settings::{self, FPS_CHOICES, FRAME_CHOICES, Format, Hotkey, Settings};
 use crate::toast::{self, Kind};
 use crate::translate::{self, Lang};
 use crate::ui::{self, rectf, rgb, rgba};
@@ -49,8 +49,18 @@ const CAPTURE_PAGE: usize = 1;
 const SERVICE_PAGE: usize = 2;
 const PRESETS: [(&str, u32); 7] =
     [("紫", 0x9C44EC), ("品红", 0xE0389A), ("红", 0xE5383B), ("橙", 0xF27A1A), ("黄", 0xF5B700), ("绿", 0x23A55A), ("白", 0xFFFFFF)];
-const TARGETS: [(Lang, &str); 3] = [(Lang::Zh, "简体中文"), (Lang::En, "English"), (Lang::Ja, "日本語")];
+/// 翻译目标只提供中文、英文。
+const TARGETS: [(Lang, &str); 2] = [(Lang::Zh, "简体中文"), (Lang::En, "English")];
 const FORMATS: [&str; 2] = ["PNG", "JPEG"];
+/// FRAME_CHOICES 各档的名字
+const FRAME_NAMES: [&str; 3] = ["细", "中", "粗"];
+/// 「截图与录屏」页：两个边框开关、边框粗细那几行的顶
+const SHOT_FRAME_Y: f32 = 268.0;
+const GIF_FRAME_Y: f32 = 312.0;
+const WIDTH_Y: f32 = 356.0;
+/// 长图显示方式沿用分段控件，放在边框设置下方
+const LONGSHOT_Y: f32 = 420.0;
+const LONGSHOT_NAMES: [&str; 2] = ["全部显示", "窗口内滚动"];
 
 /// 自绘控件
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -65,8 +75,13 @@ enum Ctl {
     Format(usize),
     /// 录屏帧率，FPS_CHOICES 里的第几个
     Fps(usize),
-    /// 「动图边框」开关
+    /// 「截图边框」「动图边框」开关
+    ShotFrame,
     GifFrame,
+    /// 边框粗细，FRAME_CHOICES 里的第几个
+    FrameWidth(usize),
+    /// 长图钉图：全部显示、原窗口内滚动
+    Longshot(usize),
     Target,
     /// 模型框右边的「选择…」：false 是翻译服务的，true 是识别服务的
     Models(bool),
@@ -152,7 +167,10 @@ struct Ui {
     save_dir: String,
     format: Format,
     fps: u32,
+    shot_frame: bool,
     gif_frame: bool,
+    frame_width: u32,
+    longshot_scroll: bool,
     target: Lang,
     /// 另用一家服务识别文字
     ocr: bool,
@@ -202,7 +220,10 @@ pub fn show(hotkey: bool) {
         save_dir: orig.save_dir.clone(),
         format: orig.save_format,
         fps: orig.record_fps,
+        shot_frame: orig.shot_frame,
         gif_frame: orig.gif_frame,
+        frame_width: orig.frame_width,
+        longshot_scroll: orig.longshot_scroll,
         target: orig.target,
         ocr: !orig.ocr_endpoint.is_empty() || !orig.ocr_model.is_empty(),
         key0: plat::api_key(settings::TRANSLATE_KEY),
@@ -336,6 +357,10 @@ impl Ui {
         FPS_CHOICES.iter().position(|f| *f == self.fps).unwrap_or(1)
     }
 
+    fn width_index(&self) -> usize {
+        FRAME_CHOICES.iter().position(|f| *f == self.frame_width).unwrap_or(1)
+    }
+
     /// 一行分段（顶 `y`）里各段的位置：外框内边距 3、段间距 2，每段文字 + 左右各 12
     fn segs<T: AsRef<str>>(&self, y: f32, labels: &[T]) -> Vec<Rect> {
         let mut x = CX + 3.0;
@@ -412,7 +437,10 @@ impl Ui {
                 v.push((Ctl::Browse, btn("浏览…", ROW0)));
                 v.extend(self.segs(136.0, &FORMATS).into_iter().enumerate().map(|(i, r)| (Ctl::Format(i), r)));
                 v.extend(self.segs(180.0, &FPS_CHOICES.map(|f| f.to_string())).into_iter().enumerate().map(|(i, r)| (Ctl::Fps(i), r)));
-                v.push((Ctl::GifFrame, self.switch_rect(268.0)));
+                v.push((Ctl::ShotFrame, self.switch_rect(SHOT_FRAME_Y)));
+                v.push((Ctl::GifFrame, self.switch_rect(GIF_FRAME_Y)));
+                v.extend(self.segs(WIDTH_Y, &FRAME_NAMES).into_iter().enumerate().map(|(i, r)| (Ctl::FrameWidth(i), r)));
+                v.extend(self.segs(LONGSHOT_Y, &LONGSHOT_NAMES).into_iter().enumerate().map(|(i, r)| (Ctl::Longshot(i), r)));
             }
             _ => {
                 v.push((Ctl::Models(false), btn("选择…", ROW0 + 44.0)));
@@ -576,7 +604,10 @@ impl Ui {
             Ctl::Swatch(_) => self.set_picker(!self.picker),
             Ctl::Format(i) => self.format = if i == 0 { Format::Png } else { Format::Jpeg },
             Ctl::Fps(i) => self.fps = FPS_CHOICES[i],
+            Ctl::ShotFrame => self.shot_frame = !self.shot_frame,
             Ctl::GifFrame => self.gif_frame = !self.gif_frame,
+            Ctl::FrameWidth(i) => self.frame_width = FRAME_CHOICES[i],
+            Ctl::Longshot(i) => self.longshot_scroll = i == 1,
             Ctl::Ocr => self.set_ocr(!self.ocr),
             Ctl::Test => self.start_test(),
             Ctl::Models(ocr) => self.start_models(ocr),
@@ -599,7 +630,15 @@ impl Ui {
                     v.push(Focus::Child(Child::Hex));
                 }
             }
-            CAPTURE_PAGE => v.extend([Focus::Ctl(Ctl::Browse), Focus::Ctl(Ctl::Format(self.format_index())), Focus::Ctl(Ctl::Fps(self.fps_index())), Focus::Ctl(Ctl::GifFrame)]),
+            CAPTURE_PAGE => v.extend([
+                Focus::Ctl(Ctl::Browse),
+                Focus::Ctl(Ctl::Format(self.format_index())),
+                Focus::Ctl(Ctl::Fps(self.fps_index())),
+                Focus::Ctl(Ctl::ShotFrame),
+                Focus::Ctl(Ctl::GifFrame),
+                Focus::Ctl(Ctl::FrameWidth(self.width_index())),
+                Focus::Ctl(Ctl::Longshot(usize::from(self.longshot_scroll))),
+            ]),
             _ => {
                 v.extend([
                     Focus::Child(Child::Endpoint),
@@ -649,7 +688,9 @@ impl Ui {
         let order = self.order();
         // 色块、分段、导航里换了哪一个都算同一站
         let same = |a: &Focus, b: &Focus| match (a, b) {
-            (Focus::Ctl(x @ (Ctl::Nav(_) | Ctl::Swatch(_) | Ctl::Format(_) | Ctl::Fps(_))), Focus::Ctl(y)) => std::mem::discriminant(x) == std::mem::discriminant(y),
+            (Focus::Ctl(x @ (Ctl::Nav(_) | Ctl::Swatch(_) | Ctl::Format(_) | Ctl::Fps(_) | Ctl::FrameWidth(_) | Ctl::Longshot(_))), Focus::Ctl(y)) => {
+                std::mem::discriminant(x) == std::mem::discriminant(y)
+            }
             _ => a == b,
         };
         let n = order.len();
@@ -703,6 +744,15 @@ impl Ui {
                         let j = (i as i32 + d).clamp(0, FPS_CHOICES.len() as i32 - 1) as usize;
                         self.fps = FPS_CHOICES[j];
                         self.focus_to(Focus::Ctl(Ctl::Fps(j)));
+                    }
+                    Some(Ctl::FrameWidth(i)) => {
+                        let j = (i as i32 + d).clamp(0, FRAME_CHOICES.len() as i32 - 1) as usize;
+                        self.frame_width = FRAME_CHOICES[j];
+                        self.focus_to(Focus::Ctl(Ctl::FrameWidth(j)));
+                    }
+                    Some(Ctl::Longshot(_)) => {
+                        self.longshot_scroll = d > 0;
+                        self.focus_to(Focus::Ctl(Ctl::Longshot(usize::from(self.longshot_scroll))));
                     }
                     Some(c @ Ctl::Target) if k == Key::Down => self.menu(c),
                     _ => {}
@@ -852,7 +902,10 @@ impl Ui {
             hotkey: hk,
             record_hotkey: rec,
             record_fps: self.fps,
+            shot_frame: self.shot_frame,
             gif_frame: self.gif_frame,
+            frame_width: self.frame_width,
+            longshot_scroll: self.longshot_scroll,
             sel_color: self.color,
             save_dir: self.save_dir.clone(),
             save_format: self.format,
@@ -1090,8 +1143,17 @@ impl Ui {
                 let fps = FPS_CHOICES.map(|f| f.to_string());
                 segments(Ctl::Fps, &fps.each_ref().map(String::as_str), self.fps_index(), "帧 / 秒");
                 hint("越高越流畅，GIF 也越大；区域大、画面变化多时实际帧率会低一些。", self.px(CX), self.px(218.0), None, ui::MUTED);
-                label("动图边框", 268.0);
-                switch(Ctl::GifFrame, self.gif_frame, "录好的 GIF 外面画一圈选区颜色的框", 268.0);
+                label("截图边框", SHOT_FRAME_Y);
+                switch(Ctl::ShotFrame, self.shot_frame, "截好的图外面画一圈选区颜色的框", SHOT_FRAME_Y);
+                label("动图边框", GIF_FRAME_Y);
+                switch(Ctl::GifFrame, self.gif_frame, "录好的 GIF 外面画一圈选区颜色的框", GIF_FRAME_Y);
+                label("边框粗细", WIDTH_Y);
+                segments(Ctl::FrameWidth, &FRAME_NAMES, self.width_index(), "录屏时区域外的框也一样粗");
+                hint("复制、保存出去的图片和 GIF 也带这圈框", self.px(CX), self.px(WIDTH_Y + 38.0), None, ui::MUTED);
+                label("长图钉图", LONGSHOT_Y);
+                segments(Ctl::Longshot, &LONGSHOT_NAMES, usize::from(self.longshot_scroll), "");
+                let text = if self.longshot_scroll { "原窗口大小，上下滚动查看；导出完整长图" } else { "缩小显示完整长图；不影响复制、保存" };
+                hint(text, self.px(CX), self.px(LONGSHOT_Y + 38.0), None, ui::MUTED);
             }
             _ => {
                 label("服务地址", ROW0);
@@ -1141,7 +1203,7 @@ impl Ui {
             let o = rectf(r.left as f32 - g, r.top as f32 - g, r.right as f32 + g, r.bottom as f32 + g);
             let radius = match ctl {
                 Ctl::Swatch(_) => 16.0,
-                Ctl::Toggle | Ctl::GifFrame | Ctl::Ocr => 14.0,
+                Ctl::Toggle | Ctl::ShotFrame | Ctl::GifFrame | Ctl::Ocr => 14.0,
                 _ => 9.0,
             };
             c.stroke_round(rectf(o.left + lw / 2.0, o.top + lw / 2.0, o.right - lw / 2.0, o.bottom - lw / 2.0), radius * s, rgb(ui::ACCENT), lw);
@@ -1442,6 +1504,25 @@ mod tests {
             ui.key(Key::Right, false, true);
         });
         assert_eq!(ui.fps, 20);
+        // 截图边框开关、边框粗细分段（方向键换一档）
+        assert!(!ui.shot_frame && ui.gif_frame && ui.frame_width == 2);
+        w.with(|ui: &mut Ui| {
+            ui.click(Ctl::ShotFrame);
+            ui.focus = Some(Ctl::FrameWidth(1));
+            ui.key(Key::Left, false, true);
+        });
+        assert!(ui.shot_frame && ui.frame_width == 1 && ui.focus == Some(Ctl::FrameWidth(0)));
+        // 长图显示方式复用分段控件，鼠标、方向键和 Tab 顺序都要可用。
+        w.with(|ui: &mut Ui| {
+            ui.click(Ctl::Longshot(1));
+            ui.focus = Some(Ctl::Longshot(1));
+            ui.key(Key::Left, false, true);
+        });
+        assert!(!ui.longshot_scroll && ui.focus == Some(Ctl::Longshot(0)));
+        w.with(|ui: &mut Ui| ui.key(Key::Right, false, true));
+        assert!(ui.longshot_scroll && ui.order().contains(&Focus::Ctl(Ctl::Longshot(1))));
+        settle(ui);
+        shoot(w.rect(), &dir.join("1-frames.png"));
         let hk = ui.orig.hotkey;
         w.set_hotkey_field(Child::RecHotkey as usize, hk.mods, hk.vk);
         w.with(|ui: &mut Ui| ui.apply());

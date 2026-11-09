@@ -10,8 +10,9 @@ mod modebar;
 use crate::annotate::{self, Doc, Editor, Pt, Tool};
 use crate::card;
 use crate::image_io;
+use crate::longshot;
 use crate::pin;
-use crate::plat::{self, Bitmap, Button, Canvas, Cursor, Event, Handler, Key, Kind as WinKind, Monitor, Point, Rect, Spec, Win};
+use crate::plat::{self, Bitmap, Button, Canvas, Cursor, Event, Handler, Image, Key, Kind as WinKind, Monitor, Point, Rect, Spec, Win};
 use crate::record;
 use crate::snap;
 use crate::toast::{self, Kind};
@@ -366,6 +367,8 @@ impl Overlay {
         match a {
             Act::Undo => self.ed.doc.can_undo(),
             Act::Redo => self.ed.doc.can_redo(),
+            // 标注跟不了滚动的内容：有标注时和录屏一样不能用
+            Act::Long => self.v.rec_ok,
             _ => true,
         }
     }
@@ -720,6 +723,7 @@ impl Overlay {
             Act::Save => self.save(w),
             Act::Pin => self.pin(w),
             Act::Record => self.record(w),
+            Act::Long => self.long(w),
             Act::Delay(d) => {
                 DELAY.set(d);
                 // 选中的那段画在操作栏里面，操作栏的范围没变，自己标重画
@@ -733,18 +737,18 @@ impl Overlay {
         }
     }
 
-    /// 选区连同标注（不带选中框）；正在输入的文字先提交
-    fn export(&mut self) -> Option<Bitmap> {
+    /// 选区连同标注（不带选中框），设置里开了截图边框就外面加一圈；正在输入的文字先提交
+    fn export(&mut self) -> Option<Image> {
         self.ed.finish_text();
         let sel = self.v.sel?;
         let out = self.frame.sub(&sel)?;
         self.ed.burn(&out, sel.left, sel.top, &self.frame);
-        Some(out)
+        let st = crate::settings::get();
+        Some(out.crop(&out.full()).framed(st.frame_px(self.mon.scale(), st.shot_frame), st.sel_color))
     }
 
     fn copy(&mut self, w: Win) {
-        let Some(out) = self.export() else { return };
-        let img = out.crop(&out.full());
+        let Some(img) = self.export() else { return };
         // 先藏起来，编码 PNG 的时间用户感觉不到
         w.hide();
         match plat::copy_image(&img) {
@@ -754,16 +758,17 @@ impl Overlay {
         w.close();
     }
 
-    /// 保存：对话框期间遮罩照常显示（不能操作），确定后关遮罩、在工作线程里写文件；取消就回来接着调
+    /// 保存：对话框期间遮罩不能操作，写入成功后再关；取消或写入失败都保留截图。
     fn save(&mut self, w: Win) {
         // 正在输入的文字先提交，对话框后面看到的就是存下来的样子
         self.update(w, |s| s.ed.finish_text());
-        let Some(out) = self.export() else { return };
-        let (img, mon) = (out.crop(&out.full()), self.mon);
+        let Some(img) = self.export() else { return };
+        let mon = self.mon;
         image_io::ask_save(w, move |path| {
-            w.close();
             toast::show(&mon, Kind::Busy, "正在保存…");
-            image_io::save_async(img, path, mon);
+            image_io::save_async(img, path, mon, move || {
+                w.with(|_: &mut Overlay| w.close());
+            });
         });
     }
 
@@ -787,6 +792,15 @@ impl Overlay {
         w.close();
         let delay = std::time::Duration::from_secs(DELAY.get().into());
         Win::later(move || record::start(mon, region, delay));
+    }
+
+    /// 长截图：遮罩关掉（释放截图帧）以后，在选区这块活的屏幕上边滚边截
+    fn long(&mut self, w: Win) {
+        let Some(r) = self.v.sel else { return };
+        let (dx, dy, mon) = (self.mon.rect.left, self.mon.rect.top, self.mon);
+        let region = Rect { left: r.left + dx, top: r.top + dy, right: r.right + dx, bottom: r.bottom + dy };
+        w.close();
+        Win::later(move || longshot::start(mon, region));
     }
 
     /// 取字、翻译：遮罩立刻关闭、释放截图帧，卡片单独留在屏幕上；按原图识别，不带标注
@@ -1198,8 +1212,7 @@ mod tests {
         let shot = Rect { left: p0.0 - 60, top: p0.1 - 60, right: p0.0 + 900, bottom: p0.1 + 560 };
         png(&screen(w).crop(&shot), "screen.png");
         // 导出：带标注、不带选中框
-        let out = s.export().unwrap();
-        png(&out.crop(&out.full()), "export.png");
+        png(&s.export().unwrap(), "export.png");
         w.close();
     }
 

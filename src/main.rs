@@ -7,6 +7,7 @@ mod app;
 mod card;
 mod hotkeys;
 mod image_io;
+mod longshot;
 mod ocr;
 mod overlay;
 mod pin;

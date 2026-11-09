@@ -2,7 +2,7 @@
 
 use crate::overlay::{self, Mode};
 use crate::plat::{self, Point};
-use crate::{card, hotkeys, pin, record, settings_ui, tray};
+use crate::{card, hotkeys, longshot, pin, record, settings_ui, tray};
 
 pub const APP: plat::App = plat::App { start, hotkey, tray_click, tray_menu, again, #[cfg(target_os = "macos")] notify };
 
@@ -18,9 +18,13 @@ fn start() {
     }
 }
 
-/// 录制中按哪个快捷键、点托盘都是停止
+/// 长截图时按键交给它（↑↓ Esc 和别的不一样）；录制中按哪个快捷键、点托盘都是停止
 fn hotkey(id: usize) {
-    if record::active() {
+    if longshot::active() {
+        longshot::key(id);
+    } else if id > hotkeys::RECORD {
+        // 长截图刚结束、还在路上的 ↑↓ Esc Enter
+    } else if record::active() {
         record::stop();
     } else if id == hotkeys::RECORD {
         overlay::show(Mode::Record);
@@ -56,6 +60,7 @@ fn tray_cmd(c: tray::Cmd) {
         tray::Cmd::Quit => {
             // 正在录的先放弃，临时文件下次启动清掉
             record::discard();
+            longshot::cancel();
             plat::quit();
         }
     }

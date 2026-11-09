@@ -26,6 +26,8 @@ pub enum Act {
     Delay(u8),
     Ocr,
     Translate,
+    /// 截图选区上的「长截图」：关掉遮罩，边滚边截
+    Long,
     Save,
     Cancel,
     Copy,
@@ -41,7 +43,7 @@ pub enum Act {
 pub type Items = [(Act, &'static str, &'static str, &'static str)];
 
 /// 截图遮罩
-pub const SHOT: [(Act, &str, &str, &str); 15] = [
+pub const SHOT: [(Act, &str, &str, &str); 16] = [
     (Act::Rect, "rect", "矩形", "R"),
     (Act::Ellipse, "ellipse", "椭圆", "E"),
     (Act::Arrow, "arrow", "箭头", "A"),
@@ -53,6 +55,7 @@ pub const SHOT: [(Act, &str, &str, &str); 15] = [
     (Act::Redo, "redo", "重做", "Ctrl+Y"),
     (Act::Ocr, "ocr", "取字", ""),
     (Act::Translate, "translate", "翻译", ""),
+    (Act::Long, "long", "长截图", ""),
     (Act::Pin, "pin", "钉图", ""),
     (Act::Save, "save", "保存", "Ctrl+S"),
     (Act::Cancel, "cancel", "取消", "Esc"),
@@ -84,9 +87,11 @@ pub const PIN: [(Act, &str, &str, &str); 14] = [
     (Act::Copy, "copy", "复制", "Ctrl+C"),
     (Act::Done, "check", "完成编辑", "Enter"),
 ];
-/// 录屏结果（原位播放的动图下面）：主按钮是复制，和截图一致
+/// 录屏、长截图的结果（原位钉着的动图、长图下面）：主按钮是复制，和截图一致
 pub const RESULT: [(Act, &str, &str, &str); 4] =
     [(Act::Pin, "pin", "钉在屏幕上", ""), (Act::Save, "save", "保存", "Ctrl+S"), (Act::Cancel, "trash", "丢弃", "Esc"), (Act::Copy, "copy", "复制", "Enter")];
+/// 长截图进行中（区域旁边那条）：主按钮是完成
+pub const LONG: [(Act, &str, &str, &str); 2] = [(Act::Cancel, "cancel", "取消", "Esc"), (Act::Done, "check", "完成", "Enter")];
 /// 钉图悬停条（鼠标停在钉图上时下面那条）：没有主按钮
 pub const HOVER: [(Act, &str, &str, &str); 6] = [
     (Act::Edit, "edit", "编辑标注", ""),
@@ -235,6 +240,18 @@ impl Bar {
             scale,
             info: info.map(|(t, at)| (t, left + px(at))),
         }
+    }
+
+    /// 整条平移 (dx, dy)
+    pub fn moved(mut self, dx: i32, dy: i32) -> Bar {
+        let mv = |r: &mut RECT| *r = RECT { left: r.left + dx, top: r.top + dy, right: r.right + dx, bottom: r.bottom + dy };
+        mv(&mut self.rect);
+        self.buttons.iter_mut().for_each(|(_, r)| mv(r));
+        self.seps.iter_mut().for_each(|x| *x += dx);
+        if let Some((_, x)) = &mut self.info {
+            *x += dx;
+        }
+        self
     }
 
     pub fn hit(&self, p: POINT) -> Option<Act> {

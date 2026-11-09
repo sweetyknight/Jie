@@ -257,3 +257,39 @@ pub fn ask_folder(owner: HWND, start: &str) -> Option<String> {
         path
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::plat::{self, Event, Key, Kind, Point, Win};
+
+    /// 用另一个线程短暂占住剪贴板，但不改剪贴板内容；会显示结果窗口和错误提示。
+    #[test]
+    #[ignore]
+    fn copy_failure_keeps_result() {
+        let mon = plat::monitor_at(Point::default());
+        let mut img = Bitmap::new(120, 80).unwrap();
+        img.pixels_mut().fill(255);
+        // 结果入口保留原选区尺寸，兼容长图的窗口内滚动模式。
+        let region = plat::Rect { left: mon.work.left + 100, top: mon.work.top + 100, right: mon.work.left + 220, bottom: mon.work.top + 180 };
+        crate::pin::create_result(img, region, "测试".into());
+        let w = *Win::all(Kind::Pin).last().unwrap();
+        std::thread::scope(|s| {
+            let (ready, wait) = std::sync::mpsc::channel();
+            let (release, held) = std::sync::mpsc::channel::<()>();
+            s.spawn(move || unsafe {
+                OpenClipboard(None).unwrap();
+                ready.send(()).unwrap();
+                let _ = held.recv();
+                let _ = CloseClipboard();
+            });
+            wait.recv().unwrap();
+            w.send(Event::Key { key: Key::Enter, mods: plat::Mods::default() });
+            // 剪贴板被占用时复制失败，结果必须留在屏幕上供用户重试。
+            drop(release);
+            assert!(w.alive());
+        });
+        w.close();
+        Win::all(Kind::Toast).into_iter().for_each(Win::close);
+    }
+}

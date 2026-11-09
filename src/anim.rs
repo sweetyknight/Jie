@@ -33,8 +33,12 @@ impl Write for Counted {
 
 pub struct Writer {
     enc: gif::Encoder<Counted>,
+    /// 整张动图的宽高（含边框）
     w: usize,
     h: usize,
+    /// 画面外面那圈边框的粗细（像素，0 是没有）和颜色 0x00RRGGBB
+    pad: usize,
+    edge: u32,
     /// 画面现在的样子（0x00RRGGBB）；还没有帧时是 u32::MAX，和任何颜色都不同
     shown: Vec<u32>,
     /// 编好、还没写出去的那一帧：下一帧来了才知道它要停多久
@@ -55,16 +59,28 @@ fn other(e: impl std::fmt::Display) -> io::Error {
 impl Writer {
     /// 在 `path` 新建 w × h 的动图（无限循环）
     pub fn create(path: &Path, w: i32, h: i32) -> io::Result<Writer> {
-        let (Ok(gw), Ok(gh)) = (u16::try_from(w), u16::try_from(h)) else { return Err(other("录制区域太大")) };
-        if gw == 0 || gh == 0 {
+        Self::framed(path, w, h, 0, 0)
+    }
+
+    /// 同 `create`，画面外面再加一圈 `pad` 像素的 `rgb`（0xRRGGBB）边框：文件是 (w + 2pad) × (h + 2pad)，帧还是交 w × h
+    pub fn framed(path: &Path, w: i32, h: i32, pad: i32, rgb: u32) -> io::Result<Writer> {
+        if w <= 0 || h <= 0 {
             return Err(other("录制区域是空的"));
         }
+        let pad = pad.max(0);
+        let (Ok(gw), Ok(gh)) = (u16::try_from(w + 2 * pad), u16::try_from(h + 2 * pad)) else { return Err(other("录制区域太大")) };
         let bytes = Arc::new(AtomicU64::new(0));
         let out = Counted { f: BufWriter::new(File::create(path)?), n: bytes.clone() };
         let mut enc = gif::Encoder::new(out, gw, gh, &[]).map_err(other)?;
         enc.set_repeat(gif::Repeat::Infinite).map_err(other)?;
-        let (w, h) = (w as usize, h as usize);
-        Ok(Writer { enc, w, h, shown: vec![u32::MAX; w * h], pending: None, t0: None, last: None, shown_cs: 0, frames: 0, bytes })
+        let (w, h) = (gw as usize, gh as usize);
+        let (pad, edge) = (pad as usize, rgb & 0xFF_FFFF);
+        Ok(Writer { enc, w, h, pad, edge, shown: vec![u32::MAX; w * h], pending: None, t0: None, last: None, shown_cs: 0, frames: 0, bytes })
+    }
+
+    /// 边框粗细（像素）
+    pub fn pad(&self) -> i32 {
+        self.pad as i32
     }
 
     /// 已经写进文件的字节数，别的线程也能读
@@ -74,13 +90,18 @@ impl Writer {
 
     /// 加一帧：`px` 是 BGRA（alpha 不看），每行 `stride` 字节，`t` 是截下它的时间。和画面现在的样子一样就不出新帧
     pub fn push(&mut self, px: &[u8], stride: usize, t: Duration) -> io::Result<()> {
-        let (w, h) = (self.w, self.h);
-        if stride < w * 4 || px.len() < (h - 1) * stride + w * 4 {
+        let (w, h, p, edge) = (self.w, self.h, self.pad, self.edge);
+        let (iw, ih) = (w - 2 * p, h - 2 * p);
+        if stride < iw * 4 || px.len() < (ih - 1) * stride + iw * 4 {
             return Err(other("帧的大小不对"));
         }
         self.last = Some((t, Instant::now()));
+        // 边框那圈颜色固定：第一帧编进去，之后不会再变
         let color = |x: usize, y: usize| {
-            let i = y * stride + x * 4;
+            if x < p || y < p || x >= w - p || y >= h - p {
+                return edge;
+            }
+            let i = (y - p) * stride + (x - p) * 4;
             u32::from_le_bytes([px[i], px[i + 1], px[i + 2], 0])
         };
         // 变了的外接框
@@ -397,6 +418,32 @@ mod tests {
         }
         assert_eq!(wr.finish().unwrap(), 1);
         assert!(Writer::create(&path, w as i32, h as i32).unwrap().finish().is_err());
+    }
+
+    /// 带边框：文件大一圈，边框是给的颜色，里面是画面；之后的帧只变了里面一块时边框不重编
+    #[test]
+    fn framed_border() {
+        let (w, h, p) = (10, 6, 2);
+        let a = frame(w, h, |x, y| (x * 10 + y) as u32);
+        let mut b = a.clone();
+        b[(3 * w + 4) * 4..][..3].copy_from_slice(&[1, 2, 3]);
+        let path = dir("framed").join("f.gif");
+        let mut wr = Writer::framed(&path, w as i32, h as i32, p as i32, 0x9C44EC).unwrap();
+        assert_eq!(wr.pad(), 2);
+        wr.push(&a, w * 4, ms(0)).unwrap();
+        wr.push(&b, w * 4, ms(70)).unwrap();
+        assert_eq!(wr.finish().unwrap(), 2);
+        let out = play(&path, 2);
+        let fw = w + 2 * p;
+        for (k, src) in [&a, &b].into_iter().enumerate() {
+            let src = rgb(src);
+            for (i, c) in out[k].0.iter().enumerate() {
+                let (x, y) = (i % fw, i / fw);
+                let inner = (p..p + w).contains(&x) && (p..p + h).contains(&y);
+                assert_eq!(*c, if inner { src[(y - p) * w + x - p] } else { 0x9C44EC }, "第 {k} 帧 ({x}, {y})");
+            }
+        }
+        assert!(Writer::framed(&path, 0, 5, 2, 0).is_err());
     }
 
     /// 时间戳换成 1/100 秒的误差不累积：15 fps 每帧都变，延迟加起来等于总时长

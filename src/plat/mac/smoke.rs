@@ -381,7 +381,8 @@ fn check_save_dialog(step: usize) {
         } else {
             assert_eq!(p, Some(path.clone()));
             let img = plat::Image { w: 2, h: 2, px: vec![0, 0, 255, 255, 0, 255, 0, 255, 255, 0, 0, 255, 255, 255, 255, 255] };
-            image_io::save_async(img, path.clone(), mon);
+            // 此测试窗口已关闭，只验证编码落盘，不需要成功后的界面动作。
+            image_io::save_async(img, path.clone(), mon, || {});
             after(0.5, move || {
                 let data = std::fs::read(&path).expect("save must write the image");
                 assert!(if jpeg { data.starts_with(&[0xFF, 0xD8]) } else { data.starts_with(b"\x89PNG\r\n\x1a\n") });

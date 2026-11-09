@@ -97,6 +97,24 @@ pub(crate) fn cocoa_point(p: Point) -> CGPoint {
 pub(crate) fn physical_rect_for_cocoa(r: CGRect) -> Rect {
     cocoa_info(CGPoint::new(r.origin.x + r.size.width / 2.0, r.origin.y + r.size.height / 2.0)).map(|s| s.physical(r)).unwrap_or_default()
 }
+/// 往屏幕上 `at` 那里发一次滚轮（`delta`：一格 120，往上为正），一格换成 3 行。
+/// 合成事件要「辅助功能」权限：没有就弹系统的请求、返回错误（用户自己滚滚轮、触控板不受影响）
+pub fn scroll(at: Point, delta: i32) -> Result<(), String> {
+    use objc2_core_graphics::{CGEvent, CGEventTapLocation, CGPreflightPostEventAccess, CGRequestPostEventAccess, CGScrollEventUnit};
+    if !CGPreflightPostEventAccess() {
+        CGRequestPostEventAccess();
+        return Err("按方向键滚动要在「系统设置 → 隐私与安全性 → 辅助功能」里允许 Jie".into());
+    }
+    let mtm = MainThreadMarker::new().ok_or("不在主线程")?;
+    let lines = if delta.abs() >= 40 { delta * 3 / 120 } else { delta.signum() };
+    let ev = CGEvent::new_scroll_wheel_event2(None, CGScrollEventUnit::Line, 1, lines, 0, 0).ok_or("建不了滚轮事件")?;
+    // CGEvent 的坐标是点，原点在主显示器左上角（cocoa 的原点在左下角）
+    let top = NSScreen::screens(mtm).firstObject().map(|s| s.frame().size.height).unwrap_or(0.0);
+    let p = cocoa_point(at);
+    CGEvent::set_location(Some(&ev), CGPoint::new(p.x, top - p.y));
+    CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&ev));
+    Ok(())
+}
 pub fn monitor_at(p: Point) -> Monitor {
     info_at(p).map(|s| s.monitor()).unwrap_or(Monitor { rect: Rect::default(), work: Rect::default(), dpi: 96 })
 }

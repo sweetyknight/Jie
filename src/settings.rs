@@ -45,8 +45,14 @@ pub struct Settings {
     pub record_hotkey: Hotkey,
     /// 录屏帧率，FPS_CHOICES 里的一个
     pub record_fps: u32,
-    /// 录好的动图钉在屏幕上时外面画一圈选区颜色的框（和屏幕内容一样时看得清范围）
+    /// 长图钉图保持原截图窗口大小、上下滚动查看；关闭时缩小显示整张图
+    pub longshot_scroll: bool,
+    /// 截好的图外面画一圈选区颜色的框：钉图上看得到，复制、保存出去的也带
+    pub shot_frame: bool,
+    /// 录好的动图外面画一圈选区颜色的框，编进 GIF 文件（钉在原处、和屏幕内容一样时也看得清范围）
     pub gif_frame: bool,
+    /// 边框粗细（DIP），FRAME_CHOICES 里的一个：录制时区域外那圈、截图和动图外面那圈都是它
+    pub frame_width: u32,
     /// 选区颜色 0xRRGGBB
     pub sel_color: u32,
     /// 保存对话框的起始文件夹；空表示系统的「图片」文件夹
@@ -63,6 +69,8 @@ pub struct Settings {
 pub const DEFAULT_COLOR: u32 = 0x9C44EC;
 /// 设置里能选的录屏帧率
 pub const FPS_CHOICES: [u32; 4] = [10, 15, 20, 30];
+/// 设置里能选的边框粗细（DIP）：细、中、粗
+pub const FRAME_CHOICES: [u32; 3] = [1, 2, 3];
 
 impl Default for Settings {
     fn default() -> Self {
@@ -70,7 +78,10 @@ impl Default for Settings {
             hotkey: Hotkey { mods: MOD_ALT | MOD_SHIFT, vk: 'A' as u32 },
             record_hotkey: Hotkey { mods: MOD_ALT | MOD_SHIFT, vk: 'S' as u32 },
             record_fps: 15,
+            longshot_scroll: false,
+            shot_frame: false,
             gif_frame: true,
+            frame_width: 2,
             sel_color: DEFAULT_COLOR,
             save_dir: String::new(),
             save_format: Format::Png,
@@ -96,8 +107,16 @@ impl Settings {
         if !FPS_CHOICES.contains(&self.record_fps) {
             self.record_fps = d.record_fps;
         }
+        if !FRAME_CHOICES.contains(&self.frame_width) {
+            self.frame_width = d.frame_width;
+        }
         self.sel_color &= 0xFF_FFFF;
         self
+    }
+
+    /// 边框粗细（物理像素）；`on` 是那一项开没开，关着是 0
+    pub fn frame_px(&self, scale: f32, on: bool) -> i32 {
+        if on { (self.frame_width as f32 * scale).round().max(1.0) as i32 } else { 0 }
     }
 
     /// 翻译服务，带上系统里存的 Key
@@ -219,11 +238,13 @@ mod tests {
     fn partial_and_invalid_values() {
         let p = dir("partial").join("settings.json");
         // 缺的字段用默认值，不认识的字段（包括 4.8 删掉的 ocr_lang、ocr_llm）忽略，不合规的快捷键换回默认
-        std::fs::write(&p, r#"{"sel_color": 15022139, "model": "m", "extra": 1, "ocr_lang": "zh-Hans-CN", "ocr_llm": false, "hotkey": {"mods": 4, "vk": 65}, "record_fps": 7}"#).unwrap();
+        std::fs::write(&p, r#"{"sel_color": 15022139, "model": "m", "extra": 1, "ocr_lang": "zh-Hans-CN", "ocr_llm": false, "hotkey": {"mods": 4, "vk": 65}, "record_fps": 7, "frame_width": 9}"#).unwrap();
         let s = read(&p);
-        assert_eq!((s.sel_color, s.model.as_str(), s.record_fps), (0xE5383B, "m", 15));
+        assert_eq!((s.sel_color, s.model.as_str(), s.record_fps, s.frame_width), (0xE5383B, "m", 15, 2));
+        // 中等粗细 2 DIP：150% 缩放是 3 像素，关着是 0
+        assert_eq!((s.frame_px(1.5, true), s.frame_px(1.5, false)), (3, 0));
         assert!(s.hotkey == Settings::default().hotkey);
-        assert!(s.save_format == Format::Png && s.target == Lang::Zh);
+        assert!(s.save_format == Format::Png && s.target == Lang::Zh && !s.longshot_scroll);
     }
 
     /// 录屏快捷键和截图快捷键撞了：换回录屏的默认值；截图快捷键正好是录屏的默认值时，录屏用截图的默认值
@@ -239,11 +260,12 @@ mod tests {
     #[test]
     fn round_trip_without_key() {
         let p = dir("round").join("settings.json");
-        let s = Settings { endpoint: "https://x.com/v1".into(), save_format: Format::Jpeg, target: Lang::Ja, ..Settings::default() };
+        // 非默认的英文目标和长图显示方式也应原样保存、读回。
+        let s = Settings { endpoint: "https://x.com/v1".into(), save_format: Format::Jpeg, target: Lang::En, longshot_scroll: true, ..Settings::default() };
         write(&p, &s).unwrap();
         assert!(read(&p) == s);
         let text = std::fs::read_to_string(&p).unwrap();
-        assert!(text.contains("\"jpeg\"") && text.contains("\"ja\""), "{text}");
+        assert!(text.contains("\"jpeg\"") && text.contains("\"en\""), "{text}");
         assert!(!text.contains("api_key") && !text.contains("\"key\""), "{text}");
     }
 

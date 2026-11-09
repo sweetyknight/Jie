@@ -140,6 +140,21 @@ pub fn set_hotkey(id: usize, mods: u32, vk: u32) -> bool {
     }
 }
 
+/// 临时占用 ↑ ↓ Esc Enter（不带修饰键，↑↓ 按住会连发），按下时调 `App::hotkey(KEY_*)`；`on` 为 false 时放掉。
+/// 被别的程序占着的那几个就没有
+pub fn grab_keys(on: bool) {
+    use crate::plat::{KEY_DOWN, KEY_ENTER, KEY_ESC, KEY_UP};
+    let hwnd = main_window();
+    for (id, vk, mods) in [(KEY_UP, 0x26, HOT_KEY_MODIFIERS(0)), (KEY_DOWN, 0x28, HOT_KEY_MODIFIERS(0)), (KEY_ESC, 0x1B, MOD_NOREPEAT), (KEY_ENTER, 0x0D, MOD_NOREPEAT)] {
+        unsafe {
+            let _ = UnregisterHotKey(Some(hwnd), id as i32);
+            if on {
+                let _ = RegisterHotKey(Some(hwnd), id as i32, mods, vk);
+            }
+        }
+    }
+}
+
 pub fn hotkey_ok(id: usize) -> bool {
     HOTKEY_OK.get(id.wrapping_sub(1)).is_some_and(|s| s.load(Ordering::Relaxed))
 }

@@ -19,7 +19,6 @@ pub const DEEPSEEK_MODEL: &str = "deepseek-flash";
 pub enum Lang {
     Zh,
     En,
-    Ja,
 }
 
 impl Lang {
@@ -27,7 +26,6 @@ impl Lang {
         match self {
             Lang::Zh => "简体中文",
             Lang::En => "English",
-            Lang::Ja => "日本語",
         }
     }
 
@@ -36,7 +34,6 @@ impl Lang {
         match self {
             Lang::Zh => "中文",
             Lang::En => "English",
-            Lang::Ja => "日本語",
         }
     }
 
@@ -45,7 +42,6 @@ impl Lang {
         match self {
             Lang::Zh => "中",
             Lang::En => "英",
-            Lang::Ja => "日",
         }
     }
 }
@@ -198,9 +194,9 @@ const OTHER_WORDS: &[&str] = &[
     "sono", "os", "em", "uma", "com", "het", "een", "van", "niet", "zijn", "met",
 ];
 
-/// 粗判原文语言：汉字和假名每个算一份，单词每个算一份。中日文占一半及以上算中文（出现假名算日文）；
+/// 粗判原文语言：汉字和假名每个算一份，单词每个算一份。汉字占一半及以上且没有假名才算中文；
 /// 否则看单词：英文虚词不比别的语言的线索（上面那些虚词、带非 ASCII 字母的词，比如重音字母、韩文、俄文）少就算英文。
-/// 别的语言和没有字都返回 None：Jie 只译成中英日，认不出的照设好的目标语言译，卡片上不写原文是哪种语言。
+/// 别的语言和没有字都返回 None：Jie 只译成中英，认不出的照设好的目标语言译，卡片上不写原文是哪种语言。
 pub fn detect(text: &str) -> Option<Lang> {
     let cjk = |c: char| {
         matches!(c, '\u{3041}'..='\u{3096}' | '\u{30A1}'..='\u{30FA}' | '\u{3400}'..='\u{4DBF}' | '\u{4E00}'..='\u{9FFF}' | '\u{F900}'..='\u{FAFF}')
@@ -220,7 +216,8 @@ pub fn detect(text: &str) -> Option<Lang> {
     if han + kana + words == 0 {
         None
     } else if han + kana >= words {
-        Some(if kana > 0 { Lang::Ja } else { Lang::Zh })
+        // 含假名的原文不算中文，避免自动切换到英文目标。
+        (kana == 0).then_some(Lang::Zh)
     } else {
         (en >= other).then_some(Lang::En)
     }
@@ -589,7 +586,9 @@ pub(crate) mod tests {
         assert_eq!(detect("Hello, world"), Some(Lang::En));
         assert_eq!(detect("使用 cargo build 命令编译 Rust 项目"), Some(Lang::Zh));
         assert_eq!(detect("The word 你好 means hello"), Some(Lang::En));
-        assert_eq!(detect("今日はいい天気ですね"), Some(Lang::Ja));
+        // 日语不标语言，也不能误判成中文。
+        assert_eq!(detect("今日はいい天気ですね"), None);
+        assert_eq!(detect("こんにちは"), None);
         assert_eq!(detect("12345 !!"), None);
         assert_eq!(detect("안녕하세요"), None);
         // 界面上没有虚词的英文、英文里夹一个重音词，还是英文
@@ -606,7 +605,10 @@ pub(crate) mod tests {
         assert_eq!(pick_target("你好", Lang::Zh), Lang::En);
         assert_eq!(pick_target("Hello", Lang::En), Lang::Zh);
         assert_eq!(pick_target("你好", Lang::En), Lang::En);
-        assert_eq!(pick_target("こんにちは", Lang::Ja), Lang::En);
+        // 日语原文仍按所选的中、英文目标翻译。
+        assert_eq!(pick_target("こんにちは", Lang::Zh), Lang::Zh);
+        assert_eq!(pick_target("こんにちは", Lang::En), Lang::En);
+        assert_eq!(pick_target("今日はいい天気ですね", Lang::Zh), Lang::Zh);
         assert_eq!(pick_target("12345", Lang::Zh), Lang::Zh);
         // 法文译成英文，不再被当成英文改译中文
         assert_eq!(pick_target("Le chat est sur la table", Lang::En), Lang::En);

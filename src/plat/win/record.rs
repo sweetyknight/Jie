@@ -174,8 +174,8 @@ impl Drop for Magnifier {
     }
 }
 
-/// 开始录区域 `r`（全局桌面物理像素），每秒 `fps` 帧。截屏失败的帧直接跳过，所以 `on_error` 不会被调（签名和 mac 一样）
-pub fn record(r: Rect, fps: u32, mut on_frame: OnFrame, _on_error: impl FnOnce(String) + Send + 'static) -> Result<Recording, String> {
+/// 开始录区域 `r`（全局桌面物理像素），每秒 `fps` 帧，`cursor`：把鼠标指针画进帧里。截屏失败的帧直接跳过，所以 `on_error` 不会被调（签名和 mac 一样）
+pub fn record(r: Rect, fps: u32, cursor: bool, mut on_frame: OnFrame, _on_error: impl FnOnce(String) + Send + 'static) -> Result<Recording, String> {
     let (w, h) = (r.right - r.left, r.bottom - r.top);
     if w <= 0 || h <= 0 {
         return Err("录制区域是空的".into());
@@ -215,7 +215,9 @@ pub fn record(r: Rect, fps: u32, mut on_frame: OnFrame, _on_error: impl FnOnce(S
                         paste(bmp.pixels_mut(), &r, c, live.as_deref().unwrap_or(snap));
                     }
                     // 指针画在盖回去的画面上面
-                    unsafe { draw_cursor(bmp.dc, r.left, r.top) };
+                    if cursor {
+                        unsafe { draw_cursor(bmp.dc, r.left, r.top) };
+                    }
                     on_frame(bmp.pixels(), w as usize * 4, t);
                 }
                 // 这个线程有放大镜的窗口：把发给它们的消息处理掉，别让广播消息的程序等着

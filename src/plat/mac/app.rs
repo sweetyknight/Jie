@@ -306,16 +306,11 @@ pub fn set_hotkey(id: usize, mods: u32, vk: u32) -> bool {
         ok_slot.store(false, Ordering::Release);
         return false;
     }
+    if !install_handler() {
+        ok_slot.store(false, Ordering::Release);
+        return false;
+    }
     unsafe {
-        if !EVENT_INSTALLED.swap(true, Ordering::AcqRel) {
-            let spec = EventTypeSpec { class: u32::from_be_bytes(*b"keyb"), kind: 5 };
-            let mut handler = std::ptr::null_mut();
-            if InstallEventHandler(GetApplicationEventTarget(), carbon_hotkey, 1, &spec, std::ptr::null_mut(), &mut handler) != 0 {
-                EVENT_INSTALLED.store(false, Ordering::Release);
-                ok_slot.store(false, Ordering::Release);
-                return false;
-            }
-        }
         let mut ref_ = std::ptr::null_mut();
         let hk_id = EventHotKeyID { signature: u32::from_be_bytes(*b"Jie "), id: id as u32 };
         let ok = RegisterEventHotKey(code, carbon_mods, hk_id, GetApplicationEventTarget(), 0, &mut ref_) == 0;
@@ -324,6 +319,46 @@ pub fn set_hotkey(id: usize, mods: u32, vk: u32) -> bool {
         }
         ok_slot.store(ok, Ordering::Release);
         ok
+    }
+}
+
+/// 装上收快捷键事件的处理函数（只装一次）；装不上返回 false
+fn install_handler() -> bool {
+    if EVENT_INSTALLED.swap(true, Ordering::AcqRel) {
+        return true;
+    }
+    let spec = EventTypeSpec { class: u32::from_be_bytes(*b"keyb"), kind: 5 };
+    let mut handler = std::ptr::null_mut();
+    if unsafe { InstallEventHandler(GetApplicationEventTarget(), carbon_hotkey, 1, &spec, std::ptr::null_mut(), &mut handler) } != 0 {
+        EVENT_INSTALLED.store(false, Ordering::Release);
+        return false;
+    }
+    true
+}
+
+/// 长截图临时占用的那几个键注册下来的句柄（指针存成整数才能放进静态变量）
+static GRABBED: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+/// 临时占用 ↑ ↓ Esc Return（不带修饰键），按下时调 `App::hotkey(KEY_*)`；`on` 为 false 时放掉。
+/// Carbon 的快捷键不连发，按住 ↑↓ 只算一下
+pub fn grab_keys(on: bool) {
+    use crate::plat::{KEY_DOWN, KEY_ENTER, KEY_ESC, KEY_UP};
+    let mut held = GRABBED.lock().unwrap_or_else(|e| e.into_inner());
+    for r in held.drain(..) {
+        unsafe {
+            let _ = UnregisterEventHotKey(r as *mut std::ffi::c_void);
+        }
+    }
+    if !on || !install_handler() {
+        return;
+    }
+    // kVK_UpArrow、kVK_DownArrow、kVK_Escape、kVK_Return
+    for (id, code) in [(KEY_UP, 126), (KEY_DOWN, 125), (KEY_ESC, 53), (KEY_ENTER, 36)] {
+        let mut r = std::ptr::null_mut();
+        let hk = EventHotKeyID { signature: u32::from_be_bytes(*b"Jie "), id: id as u32 };
+        if unsafe { RegisterEventHotKey(code, 0, hk, GetApplicationEventTarget(), 0, &mut r) } == 0 {
+            held.push(r as usize);
+        }
     }
 }
 

@@ -13,6 +13,8 @@ mod hotkeys;
 #[cfg(target_os = "macos")]
 mod image_io;
 #[cfg(target_os = "macos")]
+mod longshot;
+#[cfg(target_os = "macos")]
 mod ocr;
 #[cfg(target_os = "macos")]
 mod overlay;
@@ -37,6 +39,8 @@ mod record;
 mod settings;
 #[cfg(target_os = "macos")]
 mod settings_ui;
+#[cfg(target_os = "macos")]
+mod tray;
 #[cfg(target_os = "macos")]
 mod snap;
 #[cfg(target_os = "macos")]

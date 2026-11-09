@@ -87,15 +87,16 @@ pub fn start(mon: Monitor, region: Rect, delay: Duration) {
         return fail(e.to_string());
     }
     let path = temp_dir().join(format!("Jie_{}.gif", plat::now_stamp()));
-    let writer = match Writer::create(&path, w, h) {
+    // 边框和圆点用设置里的选区颜色，和截图选区一样；动图边框编进 GIF，和录制时那圈一样粗、在同一个位置
+    let st = settings::get();
+    let color = st.sel_color;
+    let writer = match Writer::framed(&path, w, h, st.frame_px(mon.scale(), st.gif_frame), color) {
         Ok(wr) => wr,
         Err(e) => return fail(e.to_string()),
     };
     let bytes = writer.bytes();
     let shared = Arc::new(Mutex::new(Shared { writer: Some(writer), error: None }));
     let at = Instant::now() + delay;
-    // 边框和圆点用设置里的选区颜色，和截图选区一样
-    let color = settings::sel_color();
     let mut windows = frame(&mon, region, color);
     let bar = ControlBar::open(mon, region, bytes, at, color);
     // 倒计时由控制条的定时器推着走；不延时、控制条没开出来就直接开始
@@ -129,7 +130,7 @@ fn begin() {
             (g.error, g.writer) = (Some(e.to_string()), None);
         }
     });
-    match plat::record(region, settings::get().record_fps, on_frame, |e| plat::post(move || broken(e))) {
+    match plat::record(region, settings::get().record_fps, true, on_frame, |e| plat::post(move || broken(e))) {
         Ok(rec) => {
             SESSION.with_borrow_mut(|s| {
                 if let Some(s) = s {
@@ -188,9 +189,13 @@ pub fn stop() {
         let _ = std::fs::remove_file(&e.path);
         return;
     };
-    let at = Point { x: e.region.left, y: e.region.top };
-    // 时长和大小写在结果条最左边，录完不另外弹胶囊；出错照旧弹
-    let result = e.writer.and_then(|w| w.finish().map_err(|x| x.to_string())).and_then(|_| {
+    // 时长和大小写在结果条最左边，录完不另外弹胶囊；出错照旧弹。GIF 带边框时左上角往外挪，画面还在原位置
+    let result = e.writer.and_then(|w| {
+        let pad = w.pad();
+        w.finish().map(|_| pad).map_err(|x| x.to_string())
+    });
+    let result = result.and_then(|pad| {
+        let at = Point { x: e.region.left - pad, y: e.region.top - pad };
         let bytes = std::fs::metadata(&e.path).map_or(0, |m| m.len());
         pin::create_gif(e.path.clone(), at, Some(format!("{} · {}", clock(secs), size(bytes))))
     });
@@ -244,15 +249,15 @@ fn frame_rects(mon: &Rect, r: Rect, b: i32) -> [Rect; 4] {
     ]
 }
 
-fn border(scale: f32) -> i32 {
-    (3.0 * scale).round().max(2.0) as i32
+pub(crate) fn border(scale: f32) -> i32 {
+    settings::get().frame_px(scale, true)
 }
 
 fn overlaps(a: &Rect, b: &Rect) -> bool {
     a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom
 }
 
-fn frame(mon: &Monitor, r: Rect, color: u32) -> Vec<Win> {
+pub(crate) fn frame(mon: &Monitor, r: Rect, color: u32) -> Vec<Win> {
     let mut v = Vec::new();
     for rect in frame_rects(&mon.rect, r, border(mon.scale())) {
         // 挪进区域里的那条会录进去：屏幕边本身就是边界，不画
@@ -396,7 +401,7 @@ fn contains(r: &Rect, p: Point) -> bool {
 /// 再找贴着也放得下的（在那条空隙里居中，比如压在任务栏上）；都不行放进区域里，返回 true：
 /// 区域里有任务栏就压在任务栏右边（那块画面几乎不动，录的时候盖成开始前的样子不显眼），没有就放右下角。
 /// `b` 是边框粗细，`m` 是离屏幕边至少留多少
-fn bar_rect(mon: &Rect, work: &Rect, region: Rect, (bw, bh): (i32, i32), b: i32, g: i32, m: i32) -> (Rect, bool) {
+pub(crate) fn bar_rect(mon: &Rect, work: &Rect, region: Rect, (bw, bh): (i32, i32), b: i32, g: i32, m: i32) -> (Rect, bool) {
     let at = |x: i32, y: i32| Rect { left: x, top: y, right: x + bw, bottom: y + bh };
     let x_under = (region.right + b - bw).min(mon.right - m - bw).max(mon.left + m);
     let y_side = (region.bottom - bh).min(mon.bottom - m - bh).max(mon.top + m);
@@ -816,21 +821,25 @@ mod tests {
         stop();
         assert!(!active() && Win::all(plat::Kind::RecFrame).is_empty() && Win::all(plat::Kind::RecBar).is_empty());
         let pin = *Win::all(plat::Kind::Pin).last().expect("动图钉图没出来");
-        // 动图钉图的图片在原位置，外面那圈框和录制时的边框一样粗
-        let f = if settings::get().gif_frame { border(mon.scale()) } else { 0 };
+        // 动图钉图的画面在原位置，GIF 里外面那圈框和录制时的边框一样粗
+        let st = settings::get();
+        let f = st.frame_px(mon.scale(), st.gif_frame);
         assert_eq!((pin.rect().left, pin.rect().top), (region.left - f, region.top - f));
         // 时长和大小写在结果条上，录完不弹胶囊
         assert!(!Win::all(plat::Kind::PinBar).is_empty() && Win::all(plat::Kind::Toast).is_empty(), "该有结果条、没有胶囊");
-        // 边框在区域外面，GIF 最上面一行不该是边框的颜色（RGBA、BGRA 都认）
+        // 录制时的边框在区域外面，GIF 画面最上面一行不该是边框的颜色（RGBA、BGRA 都认）；编进去的那圈框是
         let mut p = crate::anim::Player::open(&path).unwrap();
+        assert_eq!((p.w, p.h), (region.right - region.left + 2 * f, region.bottom - region.top + 2 * f));
         let mut px = vec![0u8; (p.w * p.h * 4) as usize];
         p.next(&mut px).unwrap();
         let col = settings::sel_color();
         let (r, g, b) = ((col >> 16) as u8, (col >> 8) as u8, col as u8);
         let near = |x: u8, y: u8| x.abs_diff(y) < 24;
         let edge = |c: &[u8]| near(c[1], g) && ((near(c[0], r) && near(c[2], b)) || (near(c[0], b) && near(c[2], r)));
-        let top = px[..(p.w * 4) as usize].chunks_exact(4).filter(|c| edge(c)).count();
-        assert!(top * 2 < p.w as usize, "GIF 第一行 {top}/{} 是边框颜色：边框录进去了", p.w);
+        let row = |y: i32| px[(y * p.w * 4) as usize..((y + 1) * p.w * 4) as usize].chunks_exact(4).filter(|c| edge(c)).count();
+        let top = row(f);
+        assert!(top * 2 < p.w as usize, "GIF 画面第一行 {top}/{} 是边框颜色：录制时的边框录进去了", p.w);
+        assert!(f == 0 || row(0) == p.w as usize, "动图边框没编进 GIF");
         pin.close();
         // 屏幕去掉任务栏：控制条压在任务栏上，不放进区域里
         if mon.rect.bottom - wk.bottom >= br.bottom - br.top {
@@ -977,21 +986,27 @@ mod tests {
         stop();
         // 第一帧：和开始前一样（绿的），没有控制条
         let mut p = crate::anim::Player::open(&path).unwrap();
-        let mut frame = vec![0u8; (p.w * p.h * 4) as usize];
-        p.next(&mut frame).unwrap();
-        let left = diff(before.pixels(), before.w, &frame, p.w, local);
-        let first = mean(&frame, p.w, local);
-        let not_bar = diff(shown.pixels(), shown.w, &frame, p.w, local);
+        let mut whole = vec![0u8; (p.w * p.h * 4) as usize];
+        p.next(&mut whole).unwrap();
+        // GIF 里编进去的那圈边框去掉，坐标才和屏幕对得上
+        let st = settings::get();
+        let (f, pw) = (st.frame_px(s, st.gif_frame), p.w);
+        let (gw, gh) = (pw - 2 * f, p.h - 2 * f);
+        let inner = |px: &[u8]| -> Vec<u8> { (f..f + gh).flat_map(|y| px[((y * pw + f) * 4) as usize..((y * pw + f + gw) * 4) as usize].to_vec()).collect() };
+        let frame = inner(&whole);
+        let left = diff(before.pixels(), before.w, &frame, gw, local);
+        let first = mean(&frame, gw, local);
+        let not_bar = diff(shown.pixels(), shown.w, &frame, gw, local);
         println!("GIF 第一帧控制条那块：和开始前差 {left:.1}，和控制条差 {not_bar:.1}，平均色 {first:06X}");
         assert!(not_bar > 20.0, "控制条录进去了");
-        let around = Rect { left: (local.left - 200).max(0), top: (local.top - 100).max(0), right: local.right.min(p.w), bottom: local.bottom.min(p.h) };
+        let around = Rect { left: (local.left - 200).max(0), top: (local.top - 100).max(0), right: local.right.min(gw), bottom: local.bottom.min(gh) };
         let crop = |px: &[u8], w: i32| plat::Image {
             w: around.right - around.left,
             h: around.bottom - around.top,
             px: (around.top..around.bottom).flat_map(|y| px[((y * w + around.left) * 4) as usize..((y * w + around.right) * 4) as usize].to_vec()).collect(),
         };
         let name = if via_overlay { "gif-first-overlay.png" } else { "gif-first.png" };
-        std::fs::write(tmp.join(name), plat::encode(&crop(&frame, p.w), false).unwrap()).unwrap();
+        std::fs::write(tmp.join(name), plat::encode(&crop(&frame, gw), false).unwrap()).unwrap();
         // 色块是钉图这种窗口，从遮罩来时也一直在任务栏上面：第一帧是绿的（不是控制条、也不是变暗的遮罩）
         assert!(left < 12.0 && near(first, green), "那块不是开始前的样子");
         // 最后一帧：那块跟着变成橙的
@@ -1002,9 +1017,9 @@ mod tests {
             std::iter::from_fn(|| d.read_next_frame().unwrap().map(|_| ())).count()
         };
         for _ in 1..frames {
-            p.next(&mut frame).unwrap();
+            p.next(&mut whole).unwrap();
         }
-        let last = mean(&frame, p.w, local);
+        let last = mean(&inner(&whole), gw, local);
         println!("GIF 共 {frames} 帧，最后一帧控制条那块平均色 {last:06X}");
         assert!(near(last, orange), "控制条底下那块没跟着变（是冻住的旧画面）：{last:06X}");
         // 色块和录完弹出的结果都是钉图这种窗口，一起关
@@ -1031,6 +1046,7 @@ mod tests {
         let rec = plat::record(
             r,
             15,
+            true,
             Box::new(move |px, stride, t| {
                 n.fetch_add(1, Ordering::Relaxed);
                 lock(&sink).writer.as_mut().unwrap().push(px, stride, t).unwrap();
@@ -1178,6 +1194,7 @@ mod tests {
         let rec = plat::record(
             region,
             fps,
+            true,
             Box::new(move |px, stride, t| {
                 let s = Instant::now();
                 lock(&sink).writer.as_mut().unwrap().push(px, stride, t).unwrap();

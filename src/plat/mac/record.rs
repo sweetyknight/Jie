@@ -109,6 +109,7 @@ struct Setup<R> {
     w: i32,
     h: i32,
     fps: u32,
+    cursor: bool,
     /// 录屏自己的边框和控制条的窗口编号
     skip: Vec<u32>,
     sink: Sink,
@@ -116,8 +117,8 @@ struct Setup<R> {
     report: R,
 }
 
-/// 开始录区域 `r`（全局桌面物理像素），每秒最多 `fps` 帧。流是异步建好的：建不成、开始失败时在别的线程上调 `on_error`
-pub fn record(r: Rect, fps: u32, on_frame: OnFrame, on_error: impl FnOnce(String) + Send + 'static) -> Result<Recording, String> {
+/// 开始录区域 `r`（全局桌面物理像素），每秒最多 `fps` 帧，`cursor`：帧里带鼠标指针。流是异步建好的：建不成、开始失败时在别的线程上调 `on_error`
+pub fn record(r: Rect, fps: u32, cursor: bool, on_frame: OnFrame, on_error: impl FnOnce(String) + Send + 'static) -> Result<Recording, String> {
     let (w, h) = (r.right - r.left, r.bottom - r.top);
     if w <= 0 || h <= 0 {
         return Err("录制区域是空的".into());
@@ -133,7 +134,7 @@ pub fn record(r: Rect, fps: u32, on_frame: OnFrame, on_error: impl FnOnce(String
             f(e);
         }
     };
-    fetch(Setup { display_id, source, w, h, fps, skip, sink: sink.clone(), state: state.clone(), report }, 0);
+    fetch(Setup { display_id, source, w, h, fps, cursor, skip, sink: sink.clone(), state: state.clone(), report }, 0);
     Ok(Recording { sink, state })
 }
 
@@ -158,7 +159,7 @@ fn fetch<R: Fn(String) + Clone + Send + 'static>(s: Setup<R>, tries: u32) {
             config.setWidth(s.w as usize);
             config.setHeight(s.h as usize);
             config.setPixelFormat(kCVPixelFormatType_32BGRA);
-            config.setShowsCursor(true);
+            config.setShowsCursor(s.cursor);
             config.setMinimumFrameInterval(CMTime::new(1, s.fps.clamp(1, 60) as i32));
             config.setQueueDepth(3);
             config.setColorSpaceName(kCGColorSpaceSRGB);

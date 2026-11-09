@@ -28,6 +28,12 @@ pub struct App {
     pub notify: fn(&str, &str, Option<fn()>),
 }
 
+/// 长截图时临时占用的按键（`grab_keys`），按下时 `App::hotkey` 收到这些编号；1、2 是设置里的两个全局快捷键（hotkeys.rs）
+pub const KEY_UP: usize = 3;
+pub const KEY_DOWN: usize = 4;
+pub const KEY_ESC: usize = 5;
+pub const KEY_ENTER: usize = 6;
+
 // 全局快捷键的修饰键位，就是 Windows RegisterHotKey 的 MOD_*；mac 把 MOD_WIN 当 ⌘。两个平台读同一份配置
 pub const MOD_ALT: u32 = 1;
 pub const MOD_CONTROL: u32 = 2;
@@ -309,6 +315,23 @@ pub struct Image {
     pub px: Vec<u8>,
 }
 
+impl Image {
+    /// 外面加一圈 `b` 像素的 `rgb`（0xRRGGBB）；`b` 是 0 原样返回
+    pub fn framed(self, b: i32, rgb: u32) -> Image {
+        if b <= 0 {
+            return self;
+        }
+        let (w, h) = (self.w + 2 * b, self.h + 2 * b);
+        let mut px = (rgb | 0xFF00_0000).to_le_bytes().repeat((w * h) as usize);
+        let (row, inner, b) = (w as usize * 4, self.w as usize * 4, b as usize);
+        for (y, src) in self.px.chunks_exact(inner).enumerate() {
+            let i = (y + b) * row + b * 4;
+            px[i..i + inner].copy_from_slice(src);
+        }
+        Image { w, h, px }
+    }
+}
+
 impl Bitmap {
     pub fn full(&self) -> Rect {
         Rect { left: 0, top: 0, right: self.w, bottom: self.h }
@@ -352,3 +375,21 @@ impl Bitmap {
 
 #[cfg(windows)]
 pub fn request_capture(ready: impl FnOnce(Option<(Monitor, Bitmap)>) + Send + 'static) { ready(capture_cursor_monitor()); }
+
+#[cfg(test)]
+mod tests {
+    use super::Image;
+
+    /// 加边框：大一圈，四周是给的颜色（BGRA、alpha 255），里面原样；0 不变
+    #[test]
+    fn image_framed() {
+        let img = Image { w: 2, h: 1, px: vec![1, 2, 3, 255, 4, 5, 6, 255] };
+        let out = img.framed(1, 0x9C44EC);
+        assert_eq!((out.w, out.h), (4, 3));
+        let px: Vec<&[u8]> = out.px.chunks_exact(4).collect();
+        let edge: &[u8] = &[0xEC, 0x44, 0x9C, 255];
+        assert_eq!(px.iter().filter(|p| **p == edge).count(), 10);
+        assert_eq!((px[5], px[6]), (&[1u8, 2, 3, 255][..], &[4u8, 5, 6, 255][..]));
+        assert_eq!(out.framed(0, 0).w, 4);
+    }
+}
