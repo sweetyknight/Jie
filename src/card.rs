@@ -1,10 +1,13 @@
 //! 文字卡片：OCR 和翻译结果共用，标题栏「识别 | 翻译」两个标签，同一张卡片里切换、就地翻译。
 //! 置顶的透明窗口，白底、2 墨色描边、6,6 实心阴影、圆角 12，标题栏奶油色；
 //! 正文自绘，自己做拖选、Ctrl+A、Ctrl+C、滚轮滚动，选中底色才能是浅紫。
+//! 正文按原图的版面结构排（doc.rs）：标题、代码块、带格线的表格，图片的位置贴上截图里裁出的那块；
+//! 有表格、图片时卡片自动加宽。选中、复制用纯文本，单元格之间是 Tab。
 //! 尺寸按设计稿（DIP）乘卡片所在显示器的缩放比例。
 
+use crate::doc::{self, Doc, Node};
 use crate::ocr::{self, Outcome};
-use crate::plat::{self, Button, Canvas, Color, Cursor, Edge, Event, Face, Handler, Hit, Image, Key, Monitor, Point, Rect, Spec, Text, Win};
+use crate::plat::{self, Button, Canvas, Color, Cursor, Edge, Event, Face, Handler, Hit, Image, Key, Monitor, Point, Rect, RectF, Spec, Stroke, Text, Win};
 use crate::settings;
 use crate::toast::{self, Kind};
 use crate::translate;
@@ -44,6 +47,10 @@ const TEXT3: u32 = ui::FAINT;
 const SELECTION: u32 = 0xE7D5FB;
 const ERR: u32 = 0xC62828;
 const ERR_BG: u32 = 0xFFE9E6;
+/// 表格格线、图片边框
+const GRID: u32 = 0xD3CCD9;
+/// 图片占位框的底
+const MISSING: u32 = 0xF3F1F4;
 
 const NO_SERVICE: [&str; 2] = [
     "还没有配置翻译服务",
@@ -76,7 +83,7 @@ enum Btn {
 enum Body {
     Loading,
     /// 识别结果：可以选中、复制、滚动
-    Text(String),
+    Text(Doc),
     /// 还没配置翻译服务（true 是大模型取字的服务）：去设置的入口
     NoService(bool),
     Translate(Tr),
@@ -84,10 +91,9 @@ enum Body {
 
 /// 翻译卡片的正文：译文在上，原文在下（默认折叠）
 struct Tr {
-    orig: String,
-    /// 原文的语言（认不出是 None）和行数，原文开关行「原文 · English · 3 行」用
+    orig: Doc,
+    /// 原文的语言（认不出是 None），原文开关行「原文 · English · 3 行」用
     src: Option<translate::Lang>,
-    lines: usize,
     open: bool,
     state: TrState,
 }
@@ -95,7 +101,7 @@ struct Tr {
 enum TrState {
     Busy,
     /// 译文（用时写在标题栏附注里）
-    Done(String),
+    Done(Doc),
     /// 失败原因
     Failed(String),
 }
@@ -115,9 +121,33 @@ enum Part {
 struct Block {
     x: f32,
     y: f32,
+    /// 折行宽度：点在哪一段附近按它算
+    w: f32,
     layout: Text,
     color: u32,
     part: Part,
+    /// 这段字在那一部分纯文本里的起点和长度（UTF-16）：一部分的字分在好几段里（表格每格一段）
+    start: u32,
+    len: u32,
+}
+
+impl Block {
+    fn new(x: f32, y: f32, w: f32, layout: Text, color: u32, part: Part, run: &doc::Run) -> Block {
+        Block { x, y, w, layout, color, part, start: run.start, len: run.text.encode_utf16().count() as u32 }
+    }
+}
+
+/// 不是字的东西：格线、表头和代码块的底色、图片；坐标和 Block 一样
+struct Deco {
+    r: RectF,
+    kind: DecoKind,
+    part: Part,
+}
+
+enum DecoKind {
+    Fill(u32),
+    /// 裁出的第几张图；没有这张（坐标不对，或者译文里的序号对不上）画占位框
+    Img(Option<usize>),
 }
 
 struct Card {
@@ -136,6 +166,16 @@ struct Card {
     meta: String,
     body: Body,
     blocks: Vec<Block>,
+    decos: Vec<Deco>,
+    /// 截图里裁出的图片，识别结果和译文共用
+    images: Vec<Image>,
+    /// 选区的屏幕坐标：卡片加宽时按它重新挑位置
+    src: Rect,
+    /// 卡片最后一次被摆到的左上角；窗口不在这儿了说明用户拖过，`moved` 之后就不再替它挪
+    at: Point,
+    moved: bool,
+    /// 没拖过宽度时卡片的宽（DIP）：380，有表格、图片时加宽
+    fit_w: f32,
     /// 正文排版的总高度（像素，含内边距）
     content_h: f32,
     /// 原文开关行的顶边（像素，相对正文区，没减滚动量）
@@ -263,13 +303,73 @@ fn fit_edge(edge: Edge, mut r: Rect, min: (i32, i32), max: (i32, i32)) -> Rect {
     r
 }
 
+/// 表格每列不折行要多宽（像素，含格内左右各 8 的留白）；`px` 是格里的字号
+fn table_cols(rows: &[Vec<doc::Run>], head: bool, px: f32) -> Option<Vec<f32>> {
+    let mut w = vec![0.0f32; rows.iter().map(Vec::len).max().unwrap_or(0)];
+    for (r, row) in rows.iter().enumerate() {
+        for (c, run) in row.iter().enumerate().filter(|(_, run)| !run.text.is_empty()) {
+            w[c] = w[c].max(Text::new(Face::Ui, px, head && r == 0, &run.text)?.width());
+        }
+    }
+    // 多留 1 像素：格线取整会让列窄掉不到 1 像素，刚好放得下的字就折行了
+    Some(w.into_iter().map(|w| w.ceil() + 1.0 + 16.0 * px / 14.0).collect())
+}
+
+/// 列宽：放得下就按各列自然宽；放不下时不比平均宽的列照旧，其余按自然宽的比例分剩下的
+fn fit_cols(natural: &[f32], width: f32) -> Vec<f32> {
+    let total: f32 = natural.iter().sum();
+    if total <= width {
+        return natural.to_vec();
+    }
+    let fair = width / natural.len() as f32;
+    let (narrow, wide) = natural.iter().fold((0.0, 0.0), |(n, w), &c| if c <= fair { (n + c, w) } else { (n, w + c) });
+    natural.iter().map(|&c| if c <= fair { c } else { c * (width - narrow) / wide }).collect()
+}
+
+/// 排一张表，返回高度：格里折行，一行高按最高那格，上下留 5；表头一行粗体、奶油色底；格线 1 DIP
+#[allow(clippy::too_many_arguments)]
+fn layout_table(rows: &[Vec<doc::Run>], head: bool, (x, y): (f32, f32), width: f32, px: f32, color: u32, part: Part, v: &mut Vec<Block>, deco: &mut Vec<Deco>) -> Option<f32> {
+    let u = px / 14.0;
+    let (pad, vpad, line) = (8.0 * u, 5.0 * u, u.round().max(1.0));
+    let cols = fit_cols(&table_cols(rows, head, px)?, width);
+    // 格线落在整像素上，不发虚
+    let mut xs = vec![x.round()];
+    for c in &cols {
+        xs.push((xs.last().unwrap() + c).round());
+    }
+    let mut ys = vec![y.round()];
+    for (r, row) in rows.iter().enumerate() {
+        let (top, bold) = (*ys.last().unwrap(), head && r == 0);
+        let mut h = px * 1.5;
+        for (c, run) in row.iter().enumerate().filter(|(_, run)| !run.text.is_empty()) {
+            let w = xs[c + 1] - xs[c] - 2.0 * pad;
+            let layout = Text::wrapped(Face::Ui, px, bold, &run.text, w, Some(px * 1.5))?;
+            h = h.max(layout.height());
+            v.push(Block::new(xs[c] + pad, top + vpad, w, layout, color, part, run));
+        }
+        let bottom = (top + h + 2.0 * vpad).round();
+        if bold {
+            deco.push(Deco { r: rectf(xs[0], top, *xs.last().unwrap(), bottom), kind: DecoKind::Fill(ui::CREAM), part });
+        }
+        ys.push(bottom);
+    }
+    let (l, r, t, b) = (xs[0], *xs.last().unwrap(), ys[0], *ys.last().unwrap());
+    let fill = |r: RectF| Deco { r, kind: DecoKind::Fill(GRID), part };
+    // 最右、最下那条往里收一线，整张表不超出 width
+    deco.extend(ys.iter().map(|&gy| fill(rectf(l, gy.min(b - line), r, gy.min(b - line) + line))));
+    deco.extend(xs.iter().map(|&gx| fill(rectf(gx.min(r - line), t, gx.min(r - line) + line, b))));
+    Some(b - y)
+}
+
 fn create(translate: bool, body: Body, anchor: Rect, mon: Monitor) -> Option<Win> {
     let loading = matches!(body, Body::Loading);
     let mut card = Card::new(mon.scale(), mon.work, translate, body);
+    card.src = anchor;
     card.relayout();
     let (w, h) = (card.width(), card.height());
     let others: Vec<Point> = Win::all(plat::Kind::Card).iter().map(|c| c.rect()).map(|r| Point { x: r.left, y: r.top }).collect();
     let at = place(anchor, w, h, mon.work, mon.scale(), &others);
+    card.at = at;
     let rect = Rect { left: at.x, top: at.y, right: at.x + w, bottom: at.y + h };
     let win = Win::open(Spec { kind: plat::Kind::Card, rect, title: "Jie 文字卡片", owner: None }, card)?;
     win.show();
@@ -295,6 +395,12 @@ impl Card {
             meta: String::new(),
             body,
             blocks: Vec::new(),
+            decos: Vec::new(),
+            images: Vec::new(),
+            src: Rect::default(),
+            at: Point::default(),
+            moved: false,
+            fit_w: WIDTH,
             content_h: 0.0,
             row_y: 0.0,
             copied: false,
@@ -322,7 +428,7 @@ impl Card {
 
     /// 卡片宽（DIP），正文按它折行
     fn w_dip(&self) -> f32 {
-        self.user_w.unwrap_or(WIDTH)
+        self.user_w.unwrap_or(self.fit_w)
     }
 
     /// 卡片本体的宽（像素，不含阴影）
@@ -383,45 +489,76 @@ impl Card {
         }
     }
 
-    /// 能选中的一段的文字：Main 是取字结果或译文，Orig 是原文
+    /// 能选中的一部分的纯文本：Main 是取字结果或译文，Orig 是原文
     fn part_text(&self, part: Part) -> Option<&str> {
         match (&self.body, part) {
-            (Body::Text(t), Part::Main) | (Body::Translate(Tr { state: TrState::Done(t), .. }), Part::Main) => Some(t),
-            (Body::Translate(tr), Part::Orig) => Some(&tr.orig),
+            (Body::Text(d), Part::Main) | (Body::Translate(Tr { state: TrState::Done(d), .. }), Part::Main) => Some(&d.plain),
+            (Body::Translate(tr), Part::Orig) => Some(&tr.orig.plain),
             _ => None,
         }
     }
 
-    /// 这一段排好的版；原文折叠时没有
-    fn block(&self, part: Part) -> Option<&Block> {
-        self.blocks.iter().find(|b| b.part == part)
+    /// 这一部分排出来了没有；原文折叠时没有
+    fn has(&self, part: Part) -> bool {
+        self.blocks.iter().any(|b| b.part == part)
     }
 
     /// 按当前内容和缩放比例重新排版
     fn relayout(&mut self) {
-        (self.blocks, self.content_h, self.row_y) = self.layout_body().unwrap_or_default();
+        self.fit_w = self.fit_width();
+        (self.blocks, self.decos, self.content_h, self.row_y) = self.layout_body().unwrap_or_default();
         // 拖高了、内容填不满：原文开关行（连同展开的原文）贴到最底下，空白留在译文下面
         if self.user_h.is_some() && matches!(self.body, Body::Translate(_)) {
             let extra = self.body_h() as f32 - self.content_h;
             if extra > 0.0 {
                 self.row_y += extra;
                 self.blocks.iter_mut().filter(|b| b.part == Part::Orig).for_each(|b| b.y += extra);
+                for d in self.decos.iter_mut().filter(|d| d.part == Part::Orig) {
+                    (d.r.top, d.r.bottom) = (d.r.top + extra, d.r.bottom + extra);
+                }
                 self.content_h += extra;
             }
         }
         self.scroll = self.scroll.clamp(0.0, self.max_scroll());
     }
 
-    /// 正文的各段文字、总高度、原文开关行的顶边。正文是界面字 15 号（Windows 上中日文由 DirectWrite 按 zh-CN 回落到微软雅黑），
-    /// 段与段之间不加间距（和设计稿一样只换行）。
-    fn layout_body(&self) -> Option<(Vec<Block>, f32, f32)> {
+    /// 没拖过宽度时卡片的宽（DIP）：内容里最宽的表格、图片不折行放得下，最宽到选区宽和工作区宽（减边距）里窄的那个，最少 380
+    fn fit_width(&self) -> f32 {
+        let s = self.scale;
+        let main = match &self.body {
+            Body::Text(d) | Body::Translate(Tr { state: TrState::Done(d), .. }) => self.natural_w(d, 15.0 * s) + 2.0 * PAD * s,
+            _ => 0.0,
+        };
+        let orig = match &self.body {
+            Body::Translate(tr) if tr.open => self.natural_w(&tr.orig, 13.0 * s) + 54.0 * s,
+            _ => 0.0,
+        };
+        let cap = ((self.src.right - self.src.left) as f32 + 2.0 * PAD * s).min((self.work.right - self.work.left) as f32 - 16.0 * s);
+        (main.max(orig).min(cap) / s).max(WIDTH)
+    }
+
+    /// 文档里表格不折行、图片按原大小时最宽的那个有多宽（像素）；只有字是 0
+    fn natural_w(&self, d: &Doc, px: f32) -> f32 {
+        d.nodes
+            .iter()
+            .map(|n| match n {
+                Node::Table { rows, head } => table_cols(rows, *head, px * 14.0 / 15.0).map_or(0.0, |c| c.iter().sum()),
+                Node::Image(Some(i)) => self.images.get(*i).map_or(0.0, |m| m.w as f32),
+                _ => 0.0,
+            })
+            .fold(0.0, f32::max)
+    }
+
+    /// 正文的各段文字、格线图片这些装饰、总高度、原文开关行的顶边。正文是界面字 15 号（Windows 上中日文由 DirectWrite 按 zh-CN 回落到微软雅黑），
+    /// 段内只换行，空行分开的段、表格、图片之间空 0.6 个字高。
+    fn layout_body(&self) -> Option<(Vec<Block>, Vec<Deco>, f32, f32)> {
         let s = self.scale;
         let wrap = self.px(self.w_dip() - 2.0 * PAD);
-        let mut v = Vec::new();
-        // 放一段，返回它的高度
-        let mut put = |x: f32, y: f32, layout: Text, color: u32, part: Part| {
+        let (mut v, mut d) = (Vec::new(), Vec::new());
+        // 放一段说明文字，返回它的高度
+        let plain = |v: &mut Vec<Block>, x: f32, y: f32, layout: Text, color: u32| {
             let h = layout.height();
-            v.push(Block { x, y, layout, color, part });
+            v.push(Block { x, y, w: layout.width(), layout, color, part: Part::Plain, start: 0, len: 0 });
             h
         };
         let small = |t: &str, width: f32| Text::wrapped(Face::Ui, 13.0 * s, false, t, width, Some(13.0 * 1.5 * s));
@@ -429,34 +566,78 @@ impl Card {
         let h = match &self.body {
             Body::Loading => 0.0,
             // 上 2、下 18
-            Body::Text(t) => 2.0 * s + put(PAD * s, 2.0 * s, Text::wrapped(Face::Ui, 15.0 * s, false, t, wrap, Some(LINE * s))?, TEXT, Part::Main) + 18.0 * s,
+            Body::Text(t) => 2.0 * s + self.layout_doc(t, (PAD * s, 2.0 * s), wrap, 15.0 * s, TEXT, Part::Main, &mut v, &mut d)? + 18.0 * s,
             // 标题 14/600，空 4，说明 13 号、行高 1.5，下 16
             Body::NoService(ocr) => {
                 let text = if *ocr { NO_OCR_SERVICE } else { NO_SERVICE };
-                let y = put(PAD * s, 0.0, Text::wrapped(Face::Ui, 14.0 * s, true, text[0], wrap, None)?, TEXT, Part::Plain) + 4.0 * s;
-                y + put(PAD * s, y, small(text[1], wrap)?, TEXT2, Part::Plain) + 16.0 * s
+                let y = plain(&mut v, PAD * s, 0.0, Text::wrapped(Face::Ui, 14.0 * s, true, text[0], wrap, None)?, TEXT) + 4.0 * s;
+                y + plain(&mut v, PAD * s, y, small(text[1], wrap)?, TEXT2) + 16.0 * s
             }
             Body::Translate(tr) => {
                 let mut y = match &tr.state {
                     // 上 8 + 转圈 16 + 下 22
                     TrState::Busy => 46.0 * s,
-                    TrState::Done(t) => 2.0 * s + put(PAD * s, 2.0 * s, Text::wrapped(Face::Ui, 15.0 * s, false, t, wrap, Some(LINE * s))?, TEXT, Part::Main) + 14.0 * s,
+                    TrState::Done(t) => 2.0 * s + self.layout_doc(t, (PAD * s, 2.0 * s), wrap, 15.0 * s, TEXT, Part::Main, &mut v, &mut d)? + 14.0 * s,
                     // 浅红提示条：外边距上 2、左右 16、下 14，内边距 10 / 12，警告图标 16 + 间距 8；原因 13 号、行高 1.5
                     TrState::Failed(e) => {
                         let y = 12.0 * s;
-                        y + put(52.0 * s, y, small(e, self.px(self.w_dip() - 80.0))?, ERR, Part::Plain) + 24.0 * s
+                        y + plain(&mut v, 52.0 * s, y, small(e, self.px(self.w_dip() - 80.0))?, ERR) + 24.0 * s
                     }
                 };
                 // 原文开关行；展开时原文在它下面：13 号灰字、行高 1.5，左边竖线 2 + 空 12，下 16
                 row_y = y;
                 y += ORIG_ROW * s;
                 if tr.open {
-                    y += put(34.0 * s, y, small(&tr.orig, self.px(self.w_dip() - 54.0))?, TEXT2, Part::Orig) + 16.0 * s;
+                    y += self.layout_doc(&tr.orig, (34.0 * s, y), self.px(self.w_dip() - 54.0), 13.0 * s, TEXT2, Part::Orig, &mut v, &mut d)? + 16.0 * s;
                 }
                 y
             }
         };
-        Some((v, h, row_y))
+        Some((v, d, h, row_y))
+    }
+
+    /// 排一份文档：左上角 (x, y)、宽 `width`、正文 `px` 号字（都是像素），返回高度。
+    /// 标题粗、大 2 号；代码等宽、小 2 号、奶油色底、内边距 10；表格小 1 号；图片按原大小，太宽缩到放得下。
+    #[allow(clippy::too_many_arguments)]
+    fn layout_doc(&self, d: &Doc, (x, y): (f32, f32), width: f32, px: f32, color: u32, part: Part, v: &mut Vec<Block>, deco: &mut Vec<Deco>) -> Option<f32> {
+        let u = px / 15.0;
+        let mut cy = y;
+        for (i, n) in d.nodes.iter().enumerate() {
+            if i > 0 {
+                cy += 9.0 * u;
+            }
+            match n {
+                Node::Text(kind, run) => {
+                    let (face, size, bold, inset) = match kind {
+                        doc::Kind::Para => (Face::Ui, px, false, 0.0),
+                        doc::Kind::Heading => (Face::Ui, px + 2.0 * u, true, 0.0),
+                        doc::Kind::Code => (Face::Mono, px - 2.0 * u, false, 10.0 * u),
+                    };
+                    let w = width - 2.0 * inset;
+                    let layout = Text::wrapped(face, size, bold, &run.text, w, Some(size * 1.5))?;
+                    let h = layout.height() + 2.0 * inset;
+                    if inset > 0.0 {
+                        deco.push(Deco { r: rectf(x, cy, x + width, cy + h), kind: DecoKind::Fill(ui::CREAM), part });
+                    }
+                    v.push(Block::new(x + inset, cy + inset, w, layout, color, part, run));
+                    cy += h;
+                }
+                Node::Table { rows, head } => cy += layout_table(rows, *head, (x, cy), width, px - u, color, part, v, deco)?,
+                Node::Image(i) => {
+                    let img = i.filter(|&i| i < self.images.len());
+                    let (w, h) = match img.map(|i| &self.images[i]) {
+                        Some(m) => {
+                            let w = (m.w as f32).min(width);
+                            (w, m.h as f32 * w / m.w as f32)
+                        }
+                        None => ((120.0 * u).min(width), 48.0 * u),
+                    };
+                    deco.push(Deco { r: rectf(x, cy, x + w, cy + h), kind: DecoKind::Img(img), part });
+                    cy += h;
+                }
+            }
+        }
+        Some(cy - y)
     }
 
     fn buttons(&self) -> Vec<(Btn, Rect)> {
@@ -531,7 +712,7 @@ impl Card {
             return None;
         }
         let y = (p.y - body.top) as f32 + self.scroll;
-        let has = |part: Part| self.block(part).map(|b| b.part);
+        let has = |part: Part| self.has(part).then_some(part);
         match self.body {
             Body::Text(_) => Some(Part::Main),
             Body::Translate(_) if y < self.row_y => has(Part::Main),
@@ -540,11 +721,19 @@ impl Card {
         }
     }
 
-    /// 点对应的选中那段里的位置；点在那段外面时取最近的位置
+    /// 点对应的选中那部分纯文本里的位置：先找上下最近、再找左右最近的一段（表格同一行里按列），取那段里最近的字
     fn pos_at(&self, p: Point) -> u32 {
-        let Some(b) = self.block(self.sel_part) else { return 0 };
-        let oy = self.body_rect().top as f32 - self.scroll + b.y;
-        b.layout.hit(p.x as f32 - b.x, p.y as f32 - oy)
+        let (x, y) = (p.x as f32, p.y as f32 - self.body_rect().top as f32 + self.scroll);
+        let off = |lo: f32, hi: f32, v: f32| (lo - v).max(v - hi).max(0.0);
+        let near = |b: &&Block| (off(b.y, b.y + b.layout.height(), y), off(b.x, b.x + b.w, x));
+        let blocks = self.blocks.iter().filter(|b| b.part == self.sel_part);
+        let Some(b) = blocks.min_by(|a, b| {
+            let (a, b) = (near(a), near(b));
+            a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1))
+        }) else {
+            return 0;
+        };
+        b.start + b.layout.hit(x - b.x, y - b.y)
     }
 
     fn selection(&self) -> (u32, u32) {
@@ -553,7 +742,7 @@ impl Card {
 
     /// 选中的文字；原文折叠着就没有
     fn selected(&self) -> String {
-        let (Some(t), Some(_)) = (self.part_text(self.sel_part), self.block(self.sel_part)) else { return String::new() };
+        let (Some(t), true) = (self.part_text(self.sel_part), self.has(self.sel_part)) else { return String::new() };
         let (a, b) = self.selection();
         let u: Vec<u16> = t.encode_utf16().collect();
         String::from_utf16_lossy(&u[(a as usize).min(u.len())..(b as usize).min(u.len())])
@@ -567,14 +756,21 @@ impl Card {
         }
     }
 
-    /// 内容变了：重新排版，窗口改高度，位置不动（夹回工作区）
+    /// 内容变了：重新排版，窗口改大小，位置不动（夹回工作区）；
+    /// 用户没拖过卡片、又因为表格图片变宽了，就按新大小重新挑位置，免得盖住选区
     fn refit(&mut self, win: Win) {
+        let old_w = self.width();
         self.relayout();
         let r = win.rect();
+        self.moved |= (r.left, r.top) != (self.at.x, self.at.y);
         let (w, h, m) = (self.width(), self.height(), self.pxi(8.0));
-        let x = r.left.min(self.work.right - m - w).max(self.work.left + m);
-        let y = r.top.min(self.work.bottom - m - h).max(self.work.top + m);
-        win.set_rect(Rect { left: x, top: y, right: x + w, bottom: y + h });
+        self.at = if w != old_w && !self.moved {
+            let others: Vec<Point> = Win::all(plat::Kind::Card).into_iter().filter(|&c| c != win).map(|c| c.rect()).map(|r| Point { x: r.left, y: r.top }).collect();
+            place(self.src, w, h, self.work, self.scale, &others)
+        } else {
+            Point { x: r.left.min(self.work.right - m - w).max(self.work.left + m), y: r.top.min(self.work.bottom - m - h).max(self.work.top + m) }
+        };
+        win.set_rect(Rect { left: self.at.x, top: self.at.y, right: self.at.x + w, bottom: self.at.y + h });
         win.invalidate_all();
     }
 
@@ -625,16 +821,24 @@ impl Card {
     fn arrive(&mut self, w: Win, out: Outcome) -> bool {
         w.kill_timer(T_SPIN);
         match out {
-            // 翻译：译文的位置转圈，原文开关已经能点
-            Outcome::Text { text, lines, .. } if self.translate => {
-                let src = translate::detect(&text);
-                let open = ORIG_OPEN.load(Ordering::Relaxed);
-                self.body = Body::Translate(Tr { orig: text, src, lines, open, state: TrState::Busy });
-                self.request(w);
-            }
-            Outcome::Text { text, took, lines } => {
-                self.meta = format!("{lines} 行 · {took}");
-                self.body = Body::Text(text);
+            Outcome::Text { text, took, images } => {
+                let d = doc::parse(&text);
+                // 只认出了图片也算没有字
+                if d.plain.trim().is_empty() {
+                    toast::show(&w.monitor(), Kind::Err, "没有识别到文字");
+                    return true;
+                }
+                self.images = images;
+                if self.translate {
+                    // 翻译：译文的位置转圈，原文开关已经能点
+                    let src = translate::detect(&d.plain);
+                    let open = ORIG_OPEN.load(Ordering::Relaxed);
+                    self.body = Body::Translate(Tr { orig: d, src, open, state: TrState::Busy });
+                    self.request(w);
+                } else {
+                    self.meta = format!("{} 行 · {took}", d.lines());
+                    self.body = Body::Text(d);
+                }
             }
             Outcome::Empty => {
                 toast::show(&w.monitor(), Kind::Err, "没有识别到文字");
@@ -654,14 +858,15 @@ impl Card {
         let Body::Translate(tr) = &mut self.body else { return };
         let s = settings::get();
         let cfg = s.translate_service();
-        let to = translate::pick_target(&tr.orig, cfg.target).short();
+        let to = translate::pick_target(&tr.orig.plain, cfg.target).short();
         self.pair = tr.src.map_or(format!("→ {to}"), |l| format!("{} → {to}", l.short()));
         self.meta.clear();
         tr.state = TrState::Busy;
         if self.sel_part == Part::Main {
             (self.anchor, self.caret) = (0, 0);
         }
-        let text = tr.orig.clone();
+        // 发模型给的原样文字：表格、图片标记跟着带过去，译文排出来还是原来的结构
+        let text = tr.orig.src.clone();
         std::thread::spawn(move || {
             let t0 = Instant::now();
             let out: Translated = translate::translate(&cfg, &text, translate::TIMEOUT)
@@ -682,7 +887,7 @@ impl Card {
         tr.state = match out {
             Ok((t, took)) => {
                 *meta = took;
-                TrState::Done(t)
+                TrState::Done(doc::parse(&t))
             }
             Err(e) => TrState::Failed(e),
         };
@@ -697,25 +902,25 @@ impl Card {
         }
         let cur = (std::mem::replace(&mut self.body, Body::Loading), std::mem::take(&mut self.meta), std::mem::take(&mut self.pair));
         let text = match &cur.0 {
-            Body::Text(t) => Some((t.clone(), t.lines().count().max(1))),
-            Body::Translate(t) => Some((t.orig.clone(), t.lines)),
+            Body::Text(t) => Some(t.clone()),
+            Body::Translate(t) => Some(t.orig.clone()),
             _ => None,
         };
         (self.tab_tr, self.copied, self.sel_part, self.anchor, self.caret, self.scroll) = (tr, false, Part::Main, 0, 0, 0.0);
         // 「没配置」的那页不留着：可能刚去设置里配好
         match (self.other.take().filter(|(b, ..)| !matches!(b, Body::NoService(_))), text) {
             (Some((b, m, p)), _) => (self.body, self.meta, self.pair) = (b, m, p),
-            (None, Some((orig, lines))) if tr => {
+            (None, Some(orig)) if tr => {
                 if settings::get().translate_service().ready() {
-                    let (src, open) = (translate::detect(&orig), ORIG_OPEN.load(Ordering::Relaxed));
-                    self.body = Body::Translate(Tr { orig, src, lines, open, state: TrState::Busy });
+                    let (src, open) = (translate::detect(&orig.plain), ORIG_OPEN.load(Ordering::Relaxed));
+                    self.body = Body::Translate(Tr { orig, src, open, state: TrState::Busy });
                     self.request(w);
                 } else {
                     self.body = Body::NoService(false);
                 }
             }
-            (None, Some((orig, lines))) => {
-                self.meta = format!("{lines} 行");
+            (None, Some(orig)) => {
+                self.meta = format!("{} 行", orig.lines());
                 self.body = Body::Text(orig);
             }
             (None, None) => {}
@@ -848,8 +1053,8 @@ impl Card {
                     let col = rgb(if hot { TEXT } else { TEXT2 });
                     ui::icon(c, if tr.open { "chev_down" } else { "chev" }, l + 6.0 * s, (t + bb) / 2.0 - 8.0 * s, 16.0 * s, col);
                     let label = match tr.src {
-                        Some(l) => format!("原文 · {} · {} 行", l.label(), tr.lines),
-                        None => format!("原文 · {} 行", tr.lines),
+                        Some(l) => format!("原文 · {} · {} 行", l.label(), tr.orig.lines()),
+                        None => format!("原文 · {} 行", tr.orig.lines()),
                     };
                     let lt = Text::new(Face::Ui, 12.0 * s, false, &label)?;
                     lt.truncate(rr - 6.0 * s - (l + 26.0 * s));
@@ -858,19 +1063,30 @@ impl Card {
                 for (b, r) in buttons.iter().filter(|(b, _)| *b == Btn::CopyOrig) {
                     self.draw_button(c, *b, r)?;
                 }
-                // 展开的原文左边一条 2 宽的浅紫竖线
-                if let Some(b) = self.block(Part::Orig) {
-                    let y = oy + b.y;
-                    c.fill_rect(rectf(PAD * s, y, PAD * s + 2.0 * s, y + b.layout.height()), rgb(0xE6D6F8));
+                // 展开的原文左边一条 2 宽的浅紫竖线，从原文最上到最下
+                let orig = self.blocks.iter().filter(|b| b.part == Part::Orig).map(|b| (b.y, b.y + b.layout.height()));
+                let orig = orig.chain(self.decos.iter().filter(|d| d.part == Part::Orig).map(|d| (d.r.top, d.r.bottom)));
+                if let Some((y0, y1)) = orig.reduce(|a, b| (a.0.min(b.0), a.1.max(b.1))) {
+                    c.fill_rect(rectf(PAD * s, oy + y0, PAD * s + 2.0 * s, oy + y1), rgb(0xE6D6F8));
                 }
             }
             Body::Text(_) | Body::NoService(_) => {}
         }
-        // 各段文字；选中的那段先铺浅紫底
+        // 底色、格线、图片在字下面；图片滚出正文区的不画（每次画都要建一张位图）
+        for d in &self.decos {
+            let r = rectf(d.r.left, oy + d.r.top, d.r.right, oy + d.r.bottom);
+            match d.kind {
+                DecoKind::Fill(col) => c.fill_rect(r, rgb(col)),
+                _ if r.bottom < top || r.top > bottom => {}
+                DecoKind::Img(i) => self.draw_image(c, r, i.map(|i| &self.images[i]))?,
+            }
+        }
+        // 各段文字；选中的部分先铺浅紫底
         let (a, z) = self.selection();
         for b in &self.blocks {
-            if b.part == self.sel_part && z > a {
-                for (l, t, mw, mh) in b.layout.range_rects(a, z) {
+            let (lo, hi) = (a.max(b.start), z.min(b.start + b.len));
+            if b.part == self.sel_part && hi > lo {
+                for (l, t, mw, mh) in b.layout.range_rects(lo - b.start, hi - b.start) {
                     let (x, y) = (b.x + l, oy + b.y + t);
                     c.fill_rect(rectf(x, y, x + mw, y + mh), rgb(SELECTION));
                 }
@@ -885,6 +1101,22 @@ impl Card {
             let ty = top + (view - th) * self.scroll / max;
             c.fill_round(rectf(w - 8.0 * s, ty + 2.0 * s, w - 4.0 * s, ty + th - 2.0 * s), 2.0 * s, rgba(0x000000, 0.22));
         }
+        Some(())
+    }
+
+    /// 截图里裁出的图，外面一圈 1 DIP 格线色的框；没有图时浅灰底、灰框，中间写「图片」
+    fn draw_image(&self, c: &Canvas, r: RectF, img: Option<&Image>) -> Option<()> {
+        let line = self.scale.round().max(1.0);
+        let inner = rectf(r.left + line / 2.0, r.top + line / 2.0, r.right - line / 2.0, r.bottom - line / 2.0);
+        match img {
+            Some(m) => c.pixels(&m.px, m.w as u32, m.h as u32, r),
+            None => {
+                c.fill_rect(r, rgb(MISSING));
+                let l = Text::centered(Face::Ui, 12.0 * self.scale, false, "图片", r.right - r.left, r.bottom - r.top)?;
+                c.text(&l, r.left, r.top, rgb(TEXT3));
+            }
+        }
+        c.stroke_rect(inner, rgb(if img.is_some() { GRID } else { TEXT3 }), line, Stroke::Plain);
         Some(())
     }
 
@@ -996,7 +1228,7 @@ impl Handler for Card {
                 Key::Esc => w.close(),
                 // Ctrl+A：全选刚才选过的那段，没有就选译文（取字结果）、再没有就选原文
                 Key::Char(b'A') if mods.cmd => {
-                    if let Some(part) = [self.sel_part, Part::Main, Part::Orig].into_iter().find(|p| self.block(*p).is_some()) {
+                    if let Some(part) = [self.sel_part, Part::Main, Part::Orig].into_iter().find(|p| self.has(*p)) {
                         self.sel_part = part;
                         (self.anchor, self.caret) = (0, self.part_text(part).map_or(0, |t| t.encode_utf16().count() as u32));
                         w.invalidate_all();
@@ -1025,6 +1257,7 @@ impl Handler for Card {
                 self.scale = scale;
                 self.work = plat::monitor_at(Point { x: (r.left + r.right) / 2, y: (r.top + r.bottom) / 2 }).work;
                 self.relayout();
+                self.at = Point { x: r.left, y: r.top };
                 w.set_rect(Rect { left: r.left, top: r.top, right: r.left + self.width(), bottom: r.top + self.height() });
                 w.invalidate_all();
             }
@@ -1144,7 +1377,7 @@ mod tests {
             let r = w.with(|c: &mut Card| c.sizing(w, edge, r)).unwrap();
             w.set_rect(r);
         };
-        w.with(|c: &mut Card| c.arrive(w, Outcome::Text { text: "一段会自动折行的文字，".repeat(20), took: "0.1 秒".into(), lines: 1 }));
+        w.with(|c: &mut Card| c.arrive(w, Outcome::Text { text: "一段会自动折行的文字，".repeat(20), took: "0.1 秒".into(), images: Vec::new() }));
         let (w0, content0) = (size(w).0, c.content_h);
         drag(Edge::Right, 300, 0);
         assert!(size(w).0 == w0 + 300 && c.user_w.is_some() && c.user_h.is_none(), "{:?}", size(w));
@@ -1156,7 +1389,7 @@ mod tests {
         drag(Edge::Bottom, 0, 200);
         let fixed = size(w);
         assert!(c.user_h.is_some());
-        w.with(|c: &mut Card| c.arrive(w, Outcome::Text { text: "短".into(), took: "0.1 秒".into(), lines: 1 }));
+        w.with(|c: &mut Card| c.arrive(w, Outcome::Text { text: "短".into(), took: "0.1 秒".into(), images: Vec::new() }));
         assert_eq!(size(w), fixed);
         // 右边框上是改大小，标题栏空白处是拖动
         let (cw, _) = size(w);
@@ -1168,7 +1401,7 @@ mod tests {
     /// 拖高的翻译卡片：内容填不满时原文开关行贴在正文区最底下，展开的原文跟着它；内容放得满时还接在译文后面
     #[test]
     fn orig_row_sticks_to_bottom() {
-        let tr = |open: bool| Body::Translate(Tr { orig: "Hello world".into(), src: None, lines: 1, open, state: TrState::Done("你好世界".into()) });
+        let tr = |open: bool| Body::Translate(Tr { orig: doc::parse("Hello world"), src: None, open, state: TrState::Done(doc::parse("你好世界")) });
         let mut c = Card::new(1.0, Rect { left: 0, top: 0, right: 1920, bottom: 1080 }, true, tr(false));
         c.relayout();
         let natural = c.row_y;
@@ -1189,13 +1422,89 @@ mod tests {
             }
         }
         // 译文长、卡片矮：放不下就照常接在后面、滚动
-        c.body = Body::Translate(Tr { orig: "Hello".into(), src: None, lines: 1, open: false, state: TrState::Done("一段会自动折行的文字，".repeat(20)) });
+        c.body = Body::Translate(Tr { orig: doc::parse("Hello"), src: None, open: false, state: TrState::Done(doc::parse(&"一段会自动折行的文字，".repeat(20))) });
         c.user_h = None;
         c.relayout();
         let natural = c.row_y;
         c.user_h = Some(HEAD + FOOT + 3.0 * LINE);
         c.relayout();
         assert!(c.row_y == natural && c.max_scroll() > 0.0);
+    }
+
+    #[test]
+    fn columns_share_width() {
+        assert_eq!(fit_cols(&[50.0, 100.0], 300.0), [50.0, 100.0]);
+        // 放不下：不比平均宽的列照旧，宽列分剩下的
+        assert_eq!(fit_cols(&[50.0, 300.0, 100.0], 300.0), [50.0, 150.0, 100.0]);
+        assert_eq!(fit_cols(&[400.0, 200.0], 300.0), [200.0, 100.0]);
+    }
+
+    const TABLE: &str = "价格表\n\n| 名称 | 价格 | 说明 |\n|---|---|---|\n| 苹果 | 3 | 一种很常见的水果，又甜又脆，放久了会变面，适合直接吃或者做成果汁 |\n| 香蕉 | 2 | 黄色 |\n\n![图片](#0)\n\n```\nfn main() {\n    println!(\"hi\");\n}\n```\n![图片](#9)";
+
+    /// 表格每格一段；点在格里选到那格的字；全选复制出 Tab 分格的纯文本；宽表格让卡片加宽、最宽到选区；序号对不上的图片画占位框
+    #[test]
+    fn table_layout_and_copy() {
+        let mut c = Card::new(1.0, WORK, false, Body::Text(doc::parse(TABLE)));
+        c.images = vec![Image { w: 200, h: 80, px: vec![200; 200 * 80 * 4] }];
+        c.src = r(100, 100, 700, 600);
+        c.relayout();
+        assert!(c.fit_w > WIDTH && c.fit_w <= 600.0 + 2.0 * PAD, "{}", c.fit_w);
+        // 标题 + 9 格 + 代码
+        assert_eq!(c.blocks.iter().filter(|b| b.part == Part::Main).count(), 11);
+        let imgs: Vec<_> = c.decos.iter().filter_map(|d| if let DecoKind::Img(i) = d.kind { Some((i, d.r.right - d.r.left)) } else { None }).collect();
+        assert_eq!(imgs, [(Some(0), 200.0), (None, 120.0)]);
+        // 表格没超出正文宽
+        let right = c.decos.iter().map(|d| d.r.right).fold(0.0, f32::max);
+        assert!(right <= c.px(c.w_dip() - PAD) + 0.5, "{right}");
+
+        let plain: Vec<u16> = c.part_text(Part::Main).unwrap().encode_utf16().collect();
+        let cell = |ch: char| c.blocks.iter().find(|b| b.len == 1 && plain[b.start as usize] == ch as u16).unwrap();
+        let top = c.body_rect().top as f32 - c.scroll;
+        let two = cell('2');
+        assert_eq!(c.pos_at(Point { x: (two.x + 1.0) as i32, y: (top + two.y + 5.0) as i32 }), two.start);
+        // 同一行、表格右边很远：落到最后一格「黄色」的末尾
+        let yellow = c.blocks.iter().find(|b| b.y == two.y && b.x > two.x).unwrap();
+        assert_eq!(c.pos_at(Point { x: 5000, y: (top + two.y + 5.0) as i32 }), yellow.start + yellow.len);
+
+        (c.anchor, c.caret) = (0, plain.len() as u32);
+        assert_eq!(
+            c.selected(),
+            "价格表\n名称\t价格\t说明\n苹果\t3\t一种很常见的水果，又甜又脆，放久了会变面，适合直接吃或者做成果汁\n香蕉\t2\t黄色\nfn main() {\n    println!(\"hi\");\n}"
+        );
+        assert_eq!(c.part_text(Part::Main).map(|t| t.lines().count()), Some(7));
+    }
+
+    /// 把带表格、图片、代码的取字卡片和译文卡片（展开原文）画成 PNG，看排版：
+    /// cargo test structured_card -- --ignored，图在 target/test-tmp/card-structure
+    #[test]
+    #[ignore]
+    fn structured_card() {
+        use crate::plat::Bitmap;
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join("test-tmp").join("card-structure");
+        std::fs::create_dir_all(&dir).unwrap();
+        let photo = Image { w: 240, h: 90, px: (0..240 * 90).flat_map(|i| [(i % 240) as u8, 120, (i / 240 * 2) as u8, 255]).collect() };
+        let en = "Price list\n\n| Name | Price | Notes |\n|---|---|---|\n| Apple | 3 | A very common fruit, sweet and crisp |\n| Banana | 2 | Yellow |\n\n![Image](#0)";
+        for (s, name, body) in [
+            (1.0, "ocr-100.png", Body::Text(doc::parse(TABLE))),
+            (1.5, "ocr-150.png", Body::Text(doc::parse(TABLE))),
+            (1.0, "translate.png", Body::Translate(Tr { orig: doc::parse(en), src: Some(translate::Lang::En), open: true, state: TrState::Done(doc::parse(TABLE)) })),
+        ] {
+            let tr = matches!(body, Body::Translate(_));
+            let mut c = Card::new(s, WORK, tr, body);
+            c.images = vec![Image { w: photo.w, h: photo.h, px: photo.px.clone() }];
+            c.src = r(100, 100, 900, 700);
+            // 译文卡片拖高，原文整个露出来
+            c.user_h = tr.then_some(900.0);
+            c.relayout();
+            let bmp = Bitmap::new(c.width(), c.height()).unwrap();
+            {
+                let canvas = Canvas::new(&bmp, bmp.full(), false);
+                canvas.clear(rgb(0x808080));
+                c.draw(&canvas, c.body_w() as f32, (c.height() - c.shadow()) as f32);
+            }
+            std::fs::write(dir.join(name), plat::encode(&bmp.crop(&bmp.full()), false).unwrap()).unwrap();
+        }
+        println!("卡片截图在 {}", dir.display());
     }
 
     /// 翻译卡片走一遍：没配置 → 识别 → 本地 mock 回 401 → 换服务地址点重试 → 成功（原文默认折叠）→ 展开原文；
@@ -1287,16 +1596,17 @@ mod tests {
         let c = w.peek::<Card>();
         let sent: serde_json::Value = serde_json::from_str(req.recv().unwrap().split("\r\n\r\n").nth(1).unwrap()).unwrap();
         assert_eq!(sent["model"], "m2");
-        assert_eq!(sent["messages"][1]["content"].as_str(), c.part_text(Part::Orig));
+        let Body::Translate(tr) = &c.body else { panic!() };
+        assert_eq!(sent["messages"][1]["content"].as_str(), Some(tr.orig.src.as_str()));
         assert_eq!(c.pair, "英 → 中");
         assert!(c.meta.ends_with(" 秒") && c.foot_buttons().is_empty(), "{:?}", c.meta);
         // 默认折叠：只有译文
-        assert!(c.block(Part::Orig).is_none() && c.block(Part::Main).is_some());
+        assert!(!c.has(Part::Orig) && c.has(Part::Main));
         snap(w, "3-done.png");
 
         // 展开原文，下一张卡片也记得；再折叠回来
         click(w, Btn::Toggle);
-        assert!(ORIG_OPEN.load(Ordering::Relaxed) && w.peek::<Card>().block(Part::Orig).is_some());
+        assert!(ORIG_OPEN.load(Ordering::Relaxed) && w.peek::<Card>().has(Part::Orig));
         snap(w, "4-expanded.png");
         click(w, Btn::Toggle);
         assert!(!ORIG_OPEN.load(Ordering::Relaxed));
@@ -1325,6 +1635,24 @@ mod tests {
         let meta = &w.peek::<Card>().meta;
         assert!(meta.starts_with("2 行 · ") && meta.ends_with(" 秒"), "{meta}");
         snap(w, "6-llm-text.png");
+        w.close();
+
+        // 带表格和图片坐标的结果：图片从截图里裁出来，卡片加宽后还在选区旁边；翻译时把结构原样发过去
+        let table = r#"{"choices":[{"message":{"content":"| 名称 | 价格 |\n|---|---|\n| 苹果 | 3 |\n\n![图片](100, 100, 500, 600)"}}]}"#;
+        let (vl, _req) = mock(Some(http("200 OK", table)));
+        let (good, req) = mock(Some(http("200 OK", r#"{"choices":[{"message":{"content":"| Name | Price |\n|---|---|\n| Apple | 3 |\n\n![图片](#0)"}}]}"#)));
+        use_service(&good, "m2", &vl);
+        translate(img(), anchor, mon);
+        let w = card();
+        wait(w, |c| matches!(c.body, Body::Translate(Tr { state: TrState::Done(..), .. })));
+        let c = w.peek::<Card>();
+        assert_eq!(c.images.iter().map(|m| (m.w, m.h)).collect::<Vec<_>>(), [(224, 100)]);
+        let sent: serde_json::Value = serde_json::from_str(req.recv().unwrap().split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(sent["messages"][1]["content"], "| 名称 | 价格 |\n|---|---|\n| 苹果 | 3 |\n\n![图片](#0)");
+        assert!(c.decos.iter().any(|d| matches!(d.kind, DecoKind::Img(Some(0)))));
+        assert_eq!(c.part_text(Part::Main), Some("Name\tPrice\nApple\t3"));
+        assert!(w.rect().left >= anchor.right, "卡片盖住了选区：{:?}", w.rect());
+        snap(w, "7-structured.png");
         w.close();
         println!("卡片截图在 {}", dir.display());
     }

@@ -9,6 +9,8 @@ mod app;
 #[cfg(target_os = "macos")]
 mod card;
 #[cfg(target_os = "macos")]
+mod doc;
+#[cfg(target_os = "macos")]
 mod hotkeys;
 #[cfg(target_os = "macos")]
 mod image_io;

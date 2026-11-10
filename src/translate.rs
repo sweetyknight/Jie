@@ -119,7 +119,9 @@ impl fmt::Display for Error {
 pub fn translate(cfg: &Config, text: &str, timeout: Duration) -> Result<String, Error> {
     let to = pick_target(text, cfg.target).name();
     let system = format!(
-        "你是翻译引擎。把用户发来的文字翻译成{to}。只输出译文，不要解释，不要加引号或任何前后缀。保留原文的换行。"
+        "你是翻译引擎。把用户发来的文字翻译成{to}。只输出译文，不要解释，不要加引号或任何前后缀。保留原文的换行和空行。\
+         原文里的 Markdown 结构原样保留：表格的行、列和 | 分隔行，# 标题，列表的符号和编号，``` 代码块（代码不翻译），\
+         ![图片](…) 这样的行原样照抄。"
     );
     chat(cfg, json!([{"role": "system", "content": system}, {"role": "user", "content": text}]), timeout)
 }
@@ -129,7 +131,13 @@ pub fn test_connection(cfg: &Config, timeout: Duration) -> Result<(), Error> {
     chat(cfg, json!([{"role": "system", "content": "只回复 OK。"}, {"role": "user", "content": "ping"}]), timeout).map(drop)
 }
 
-const OCR_PROMPT: &str = "把图片里的文字原样转写出来：逐字照抄，不翻译，不改错别字，不补全被截断的字，不加解释、标题或任何前后缀，不用 Markdown。按阅读顺序输出；同一段文字在屏幕上自动折行的地方接起来，真正的换行（分段、列表项、代码、诗）保留，代码的缩进保留。图里没有文字就什么都不输出。";
+/// 输出的格式由 doc.rs 解析，图片坐标由 ocr.rs 换成裁出的图
+const OCR_PROMPT: &str = "把图片里的文字原样转写出来：逐字照抄，不翻译，不改错别字，不补全被截断的字，不加解释、标题或任何前后缀。\
+按阅读顺序输出，用 Markdown 保留版面结构：表格写成 Markdown 表格，第一行是表头时下面加 |---| 分隔行，合并的单元格把字写在第一格、其余格留空；\
+标题前加 #；代码放进 ``` 代码块，缩进保留；列表保留原来的符号或编号。不用加粗、斜体、链接这类行内标记。\
+照片、插图、图表这类较大的图片单独占一行，写成 ![图片](左,上,右,下)，四个数是图片在这张图里的位置，左右按图宽、上下按图高各分成 0 到 1000；\
+图片里的字不转写，小图标不用管。同一段文字在屏幕上自动折行的地方接起来，真正的换行（列表项、诗）保留，段落之间空一行。\
+图里没有文字就什么都不输出。";
 
 /// 大模型取字：`png` 是 base64 编码的 PNG，返回图里的文字，没有字时为空。
 /// 提示词和图片放在同一条用户消息里：有的 OCR 模型不理会 system。
@@ -149,11 +157,13 @@ pub fn test_image(cfg: &Config, timeout: Duration) -> Result<(), Error> {
     read_image(cfg, WHITE_PNG, timeout).map(drop)
 }
 
-/// 模型偶尔还是会把结果整个包进 ``` 代码块：剥掉，连同 ```text 这一行
+/// 模型偶尔会把结果整个包进 ``` 代码块：剥掉，连同 ```text 这一行；标了编程语言的是真的代码，留给 doc.rs 按代码排
 fn unfence(t: &str) -> &str {
-    match t.strip_prefix("```").and_then(|r| r.strip_suffix("```")) {
-        Some(inner) => inner.split_once('\n').map_or(inner, |(_, body)| body).trim_end(),
-        None => t,
+    let Some(inner) = t.strip_prefix("```").and_then(|r| r.strip_suffix("```")) else { return t };
+    match inner.split_once('\n') {
+        Some((lang, body)) if matches!(lang.trim(), "" | "markdown" | "md" | "text" | "txt" | "plaintext") => body.trim_end(),
+        Some(_) => t,
+        None => inner,
     }
 }
 
@@ -555,7 +565,8 @@ pub(crate) mod tests {
     #[test]
     fn fences() {
         assert_eq!(unfence("```\na\nb\n```"), "a\nb");
-        assert_eq!(unfence("```python\ndef f():\n    pass\n```"), "def f():\n    pass");
+        assert_eq!(unfence("```python\ndef f():\n    pass\n```"), "```python\ndef f():\n    pass\n```");
+        assert_eq!(unfence("```markdown\n| a | b |\n```"), "| a | b |");
         assert_eq!(unfence("```一行```"), "一行");
         assert_eq!(unfence("a ``` b"), "a ``` b");
         assert_eq!(unfence("```rust\nfn main() {}"), "```rust\nfn main() {}");

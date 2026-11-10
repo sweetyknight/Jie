@@ -1,12 +1,13 @@
 //! 取字入口：把截图发给 OpenAI 兼容的看图模型（请求在 translate.rs），本机不识别。
 
-use crate::plat::{self, Image};
+use crate::doc;
+use crate::plat::{self, Image, Rect};
 use crate::translate;
 use std::time::Instant;
 
 pub enum Outcome {
-    /// 识别出的文字（逐行，\n 分隔）、标题栏上的用时「1.4 秒」、行数
-    Text { text: String, took: String, lines: usize },
+    /// 识别出的文字（简化的 Markdown，见 doc.rs）、标题栏上的用时「1.4 秒」、从截图里裁出的图片（文字里写成 ![图片](#序号)）
+    Text { text: String, took: String, images: Vec<Image> },
     Empty,
     Failed(String),
 }
@@ -20,8 +21,9 @@ pub fn recognize(img: &Image, cfg: &translate::Config) -> Outcome {
     let t0 = Instant::now();
     // 编码在本线程按顺序做（WIC 每次进出临时 MTA），只有请求并发
     let mut pngs = Vec::new();
-    for (y0, y1) in strips(img) {
-        match plat::encode(&rows(img, y0, y1), false) {
+    let strips = strips(img);
+    for &(y0, y1) in &strips {
+        match plat::encode(&cut(img, Rect { left: 0, top: y0, right: img.w, bottom: y1 }), false) {
             Ok(p) => pngs.push(base64(&p)),
             Err(e) => return Outcome::Failed(e),
         }
@@ -30,15 +32,15 @@ pub fn recognize(img: &Image, cfg: &translate::Config) -> Outcome {
         let hs: Vec<_> = pngs.iter().map(|png| sc.spawn(move || translate::read_image(cfg, png, translate::OCR_TIMEOUT))).collect();
         hs.into_iter().map(|h| h.join().expect("识别请求线程")).collect()
     });
-    let mut text = String::new();
-    for p in parts {
+    let (mut text, mut images) = (String::new(), Vec::new());
+    for (p, &(y0, y1)) in parts.into_iter().zip(&strips) {
         match p {
             Ok(t) if t.is_empty() => {}
             Ok(t) => {
                 if !text.is_empty() {
                     text.push('\n');
                 }
-                text.push_str(&t);
+                text.push_str(&cut_images(&t, img, y0, y1, &mut images));
             }
             Err(e) => return Outcome::Failed(e.to_string()),
         }
@@ -46,8 +48,38 @@ pub fn recognize(img: &Image, cfg: &translate::Config) -> Outcome {
     if text.is_empty() {
         Outcome::Empty
     } else {
-        Outcome::Text { lines: text.lines().count(), took: format!("{:.1} 秒", t0.elapsed().as_secs_f32()), text }
+        Outcome::Text { took: format!("{:.1} 秒", t0.elapsed().as_secs_f32()), text, images }
     }
+}
+
+/// 第 [y0, y1) 行那一条的结果里单占一行的 `![图片](左,上,右,下)`：按坐标从整张图里裁出来放进 `out`，
+/// 换成 `![图片](#序号)`；坐标没给或不对的换成 `![图片]()`（卡片上画占位框）
+fn cut_images(text: &str, img: &Image, y0: i32, y1: i32, out: &mut Vec<Image>) -> String {
+    let lines: Vec<String> = text
+        .lines()
+        .map(|line| match doc::image_ref(line) {
+            Some(inside) => match image_box(inside, img.w, y1 - y0) {
+                Some(r) => {
+                    out.push(cut(img, Rect { top: r.top + y0, bottom: r.bottom + y0, ..r }));
+                    format!("![图片](#{})", out.len() - 1)
+                }
+                None => "![图片]()".into(),
+            },
+            None => line.into(),
+        })
+        .collect();
+    lines.join("\n")
+}
+
+/// 「左,上,右,下」在 w × h 的图里的像素框，按 0–1000 的千分比算；不是四个数、太小（不到 8 像素见方）是 None
+fn image_box(s: &str, w: i32, h: i32) -> Option<Rect> {
+    let n: Vec<f32> = s.split([',', ' ', '[', ']']).filter(|t| !t.is_empty()).map(|t| t.parse().ok()).collect::<Option<_>>()?;
+    let &[l, t, r, b] = &n[..] else { return None };
+    // shortcut: 有的模型给像素，有数超过 1000 才认得出；小图上给像素会被当成千分比，碰上了再按模型分
+    let (sx, sy) = if n.iter().any(|&v| v > 1000.0) { (1.0, 1.0) } else { (w as f32 / 1000.0, h as f32 / 1000.0) };
+    let px = |v: f32, k: f32, max: i32| ((v * k).round() as i32).clamp(0, max);
+    let r = Rect { left: px(l, sx, w), top: px(t, sy, h), right: px(r, sx, w), bottom: px(b, sy, h) };
+    (r.right - r.left >= 8 && r.bottom - r.top >= 8).then_some(r)
 }
 
 /// 横着切成几条整宽的：每条不超过 `MAX_PX` 像素；切口在每条下沿往上 1/4 条高以内，挑和行首像素不一样的最少的那一行，尽量切在字行之间
@@ -67,10 +99,14 @@ fn strips(img: &Image) -> Vec<(i32, i32)> {
     v
 }
 
-/// 第 [y0, y1) 行拷成一张图
-fn rows(img: &Image, y0: i32, y1: i32) -> Image {
-    let r = (img.w * 4) as usize;
-    Image { w: img.w, h: y1 - y0, px: img.px[y0 as usize * r..y1 as usize * r].to_vec() }
+/// r 那一块拷成一张图（r 在图里面）
+fn cut(img: &Image, r: Rect) -> Image {
+    let (w, row) = ((r.right - r.left) as usize * 4, img.w as usize * 4);
+    let mut px = Vec::with_capacity(w * (r.bottom - r.top) as usize);
+    for y in r.top as usize..r.bottom as usize {
+        px.extend_from_slice(&img.px[y * row + r.left as usize * 4..][..w]);
+    }
+    Image { w: r.right - r.left, h: r.bottom - r.top, px }
 }
 
 /// 标准 base64，带 = 补齐。不用 WinRT 的 CryptographicBuffer：windows crate 全局缓存它的工厂，
@@ -148,6 +184,26 @@ pub(crate) mod tests {
         assert_eq!(super::strips(&Image { w: 800, h: 600, px: vec![255; 800 * 600 * 4] }), vec![(0, 600)]);
     }
 
+    /// 图片标记：千分比按这一条的宽高换成像素、加上这一条的顶边，从整张图里裁出来；像素坐标、坏坐标、太小的框
+    #[test]
+    fn images_cut_from_strip() {
+        let (w, h) = (200, 300);
+        let px = (0..w * h).flat_map(|i| [(i % w) as u8, (i / w) as u8, 0, 255]).collect();
+        let img = Image { w, h, px };
+        let mut out = Vec::new();
+        let t = super::cut_images("上\n![图片](100, 0, 600, 500)\n ![x]([50,50,100,150]) \n![图片](1, 2)\n![图片](0,0,10,10)\n下", &img, 100, 300, &mut out);
+        assert_eq!(t, "上\n![图片](#0)\n![图片](#1)\n![图片]()\n![图片]()\n下");
+        // 这一条 200 × 200：(20, 0)–(120, 100)、(10, 10)–(20, 30)，在整张图里往下挪 100；像素的蓝、绿是它的 x、y
+        assert_eq!(out.len(), 2);
+        assert_eq!((out[0].w, out[0].h, out[0].px[0], out[0].px[1]), (100, 100, 20, 100));
+        assert_eq!((out[1].w, out[1].h, out[1].px[0], out[1].px[1]), (10, 20, 10, 110));
+        let last = &out[1].px[out[1].px.len() - 4..];
+        assert_eq!((last[0], last[1]), (19, 129));
+        // 有数超过 1000：当像素
+        assert_eq!(super::image_box("10,20,1500,40", 2000, 100), Some(crate::plat::Rect { left: 10, top: 20, right: 1500, bottom: 40 }));
+        assert_eq!(super::image_box("a,b,c,d", 100, 100), None);
+    }
+
     #[test]
     fn base64() {
         for (raw, b64) in [("", ""), ("f", "Zg=="), ("fo", "Zm8="), ("foo", "Zm9v"), ("foobar", "Zm9vYmFy"), ("\u{ff}\u{fe}", "w7/Dvg==")] {
@@ -163,7 +219,7 @@ pub(crate) mod tests {
         for _ in 0..2 {
             let (base, req) = mock(Some(http("200 OK", r#"{"choices":[{"message":{"content":"hello"}}]}"#)));
             let cfg = crate::translate::Config { endpoint: base, model: "vl".into(), api_key: String::new(), target: crate::translate::Lang::Zh };
-            assert!(matches!(super::recognize(&img, &cfg), super::Outcome::Text { ref text, lines: 1, .. } if text == "hello"));
+            assert!(matches!(super::recognize(&img, &cfg), super::Outcome::Text { ref text, .. } if text == "hello"));
             assert!(req.recv().unwrap().contains("data:image/png;base64,iVBORw0KGgo"));
         }
     }
@@ -220,12 +276,55 @@ pub(crate) mod tests {
                 super::Outcome::Empty => String::new(),
                 super::Outcome::Failed(e) => panic!("{font:?} {px}: {e}"),
             };
-            let (e, t) = (cer(want, &got), t0.elapsed().as_secs_f64());
+            // 结果是 Markdown：按卡片复制出来的纯文本算错误率
+            let (e, t) = (cer(want, &crate::doc::parse(&got).plain), t0.elapsed().as_secs_f64());
             println!("[{font:?} {px} 像素 · {w}×{h}] 错 {e:.1}% · {t:.1} 秒\n{got}\n");
             (errs, secs) = (errs + e, secs + t);
         }
         let n = cases.len() as f64;
         println!("{}：平均错误率 {:.2}%，平均每张 {:.1} 秒", cfg.model, errs / n, secs / n);
+
+        // 版面：标题、3 × 3 的表格、一块图片、一段字。打印认出的结构和裁出的图有多大（图在 (20, 200)–(220, 300)）
+        let (img, want) = layout_sample();
+        match super::recognize(&img, &cfg) {
+            super::Outcome::Text { text, images, .. } => {
+                let d = crate::doc::parse(&text);
+                let tables: Vec<_> = d.nodes.iter().filter_map(|n| if let crate::doc::Node::Table { rows, head } = n { Some((rows.len(), rows[0].len(), *head)) } else { None }).collect();
+                let boxes: Vec<_> = images.iter().map(|m| (m.w, m.h)).collect();
+                println!("[版面] 错 {:.1}% · 表格（行, 列, 表头）{tables:?} · 裁出的图 {boxes:?}（应是 200×100）\n{text}\n", cer(want, &d.plain));
+            }
+            super::Outcome::Empty => println!("[版面] 没认出字"),
+            super::Outcome::Failed(e) => panic!("版面: {e}"),
+        }
+    }
+
+    /// 版面样张（600 × 380 白底）和它的纯文本
+    fn layout_sample() -> (Image, &'static str) {
+        use crate::ui::rectf;
+        let bmp = Bitmap::new(600, 380).unwrap();
+        let cells = [["名称", "单价", "库存"], ["苹果", "3.5 元", "120"], ["香蕉", "2 元", "80"]];
+        {
+            let c = Canvas::new(&bmp, bmp.full(), false);
+            c.clear(rgb(0xFFFFFF));
+            let ink = rgb(0x1A1A1A);
+            c.text(&Text::new(Face::Cjk, 18.0, true, "水果价格").unwrap(), 20.0, 14.0, ink);
+            for i in 0..4 {
+                let (x, y) = (20.0 + 140.0 * i as f32, 50.0 + 40.0 * i as f32);
+                c.fill_rect(rectf(20.0, y, 440.0, y + 1.0), ink);
+                c.fill_rect(rectf(x, 50.0, x + 1.0, 170.0), ink);
+            }
+            for (r, row) in cells.iter().enumerate() {
+                for (k, t) in row.iter().enumerate() {
+                    c.text(&Text::new(Face::Cjk, 14.0, r == 0, t).unwrap(), 30.0 + 140.0 * k as f32, 60.0 + 40.0 * r as f32, ink);
+                }
+            }
+            // 「照片」：一块渐变
+            for y in 0..100 {
+                c.fill_rect(rectf(20.0, 200.0 + y as f32, 220.0, 201.0 + y as f32), rgb(0x2E7D32 + ((y as u32 * 2) << 16)));
+            }
+            c.text(&Text::new(Face::Cjk, 14.0, false, "上图是今天到货的苹果。").unwrap(), 20.0, 320.0, ink);
+        }
+        (bmp.crop(&bmp.full()), "水果价格\n名称单价库存\n苹果3.5元120\n香蕉2元80\n上图是今天到货的苹果。")
     }
 
     #[test]

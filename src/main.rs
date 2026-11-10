@@ -5,6 +5,7 @@ mod anim;
 mod annotate;
 mod app;
 mod card;
+mod doc;
 mod hotkeys;
 mod image_io;
 mod longshot;
