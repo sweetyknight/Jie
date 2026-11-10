@@ -865,7 +865,7 @@ impl Card {
         if self.sel_part == Part::Main {
             (self.anchor, self.caret) = (0, 0);
         }
-        // 发模型给的原样文字：表格、图片标记跟着带过去，译文排出来还是原来的结构
+        // 发合并软折行后的 Markdown：显示、复制、翻译使用同一段落结构。
         let text = tr.orig.src.clone();
         std::thread::spawn(move || {
             let t0 = Instant::now();
@@ -1469,9 +1469,9 @@ mod tests {
         (c.anchor, c.caret) = (0, plain.len() as u32);
         assert_eq!(
             c.selected(),
-            "价格表\n名称\t价格\t说明\n苹果\t3\t一种很常见的水果，又甜又脆，放久了会变面，适合直接吃或者做成果汁\n香蕉\t2\t黄色\nfn main() {\n    println!(\"hi\");\n}"
+            "价格表\n\n名称\t价格\t说明\n苹果\t3\t一种很常见的水果，又甜又脆，放久了会变面，适合直接吃或者做成果汁\n香蕉\t2\t黄色\n\nfn main() {\n    println!(\"hi\");\n}"
         );
-        assert_eq!(c.part_text(Part::Main).map(|t| t.lines().count()), Some(7));
+        assert_eq!(c.part_text(Part::Main).map(|t| t.lines().count()), Some(9));
     }
 
     /// 把带表格、图片、代码的取字卡片和译文卡片（展开原文）画成 PNG，看排版：
@@ -1624,7 +1624,7 @@ mod tests {
         snap(w, "5-no-ocr-service.png");
         w.close();
 
-        // 配好了：截图编成 PNG 发过去，回来的文字进卡片，标题栏写行数和用时
+        // 配好了：截图编成 PNG 发过去，两个视觉行合成一段，标题栏写逻辑行数和用时。
         let (vl, req) = mock(Some(http("200 OK", vl_reply)));
         set(&format!(r#"{{"ocr_endpoint":"{vl}","ocr_model":"vl"}}"#));
         ocr(img(), anchor, mon);
@@ -1633,7 +1633,7 @@ mod tests {
         let sent = req.recv().unwrap();
         assert!(sent.contains("data:image/png;base64,iVBORw0KGgo") && sent.contains(r#""model":"vl""#), "{}", &sent[..400.min(sent.len())]);
         let meta = &w.peek::<Card>().meta;
-        assert!(meta.starts_with("2 行 · ") && meta.ends_with(" 秒"), "{meta}");
+        assert!(meta.starts_with("1 行 · ") && meta.ends_with(" 秒"), "{meta}");
         snap(w, "6-llm-text.png");
         w.close();
 

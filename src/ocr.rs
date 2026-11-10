@@ -298,6 +298,28 @@ pub(crate) mod tests {
         }
     }
 
+    /// 手工复核真实 PNG 的换行与完整性；沿用已配置的服务并计费，输出供逐项对照原图。
+    /// 设置 JIE_OCR_IMAGE 后运行 cargo test llm_layout_file -- --ignored --nocapture。
+    #[test]
+    #[ignore]
+    fn llm_layout_file() {
+        crate::settings::load();
+        let s = crate::settings::get();
+        let cfg = s.ocr_service();
+        assert!(cfg.ready(), "识别服务未配置");
+        let png = std::fs::read(std::env::var_os("JIE_OCR_IMAGE").expect("请设置 JIE_OCR_IMAGE 为 PNG 路径")).unwrap();
+        let text = crate::translate::read_image(&cfg, &super::base64(&png), crate::translate::OCR_TIMEOUT).unwrap();
+        let d = crate::doc::parse(&text);
+        let dir = std::path::Path::new("target/test-tmp/ocr-layout");
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("recognized.md"), &text).unwrap();
+        std::fs::write(dir.join("plain.txt"), &d.plain).unwrap();
+        println!("识别模型：{} · {} 行\n{text}", cfg.model, d.lines());
+        let tr = crate::translate::translate(&s.translate_service(), &d.src, crate::translate::OCR_TIMEOUT).unwrap();
+        std::fs::write(dir.join("translated.md"), &tr).unwrap();
+        println!("译文：\n{tr}");
+    }
+
     /// 版面样张（600 × 380 白底）和它的纯文本
     fn layout_sample() -> (Image, &'static str) {
         use crate::ui::rectf;
