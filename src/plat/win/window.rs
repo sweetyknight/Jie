@@ -24,6 +24,8 @@ use windows::core::{HSTRING, PCWSTR, w};
 
 /// 工作线程交回窗口的活：lParam 是 Box<Job>
 const WM_RUN: u32 = WM_APP + 0x100;
+/// 遮罩重画后补刷一遍的定时器（见 WM_PAINT）；和 Handler 自己的定时器编号错开
+const ECHO_TIMER: usize = 0x4A49;
 
 type Job = Box<dyn FnOnce(&mut dyn Any, Win) + Send>;
 
@@ -47,6 +49,8 @@ struct State {
     size: Cell<(i32, i32)>,
     /// 设置窗口的系统输入框
     fields: RefCell<Fields>,
+    /// 遮罩：画过、等着补刷一遍的范围
+    echo: Cell<Option<Rect>>,
 }
 
 thread_local! {
@@ -87,8 +91,7 @@ fn layered(kind: Kind) -> bool {
 fn styles(kind: Kind) -> (WINDOW_EX_STYLE, WINDOW_STYLE) {
     let pop = WS_EX_TOPMOST | WS_EX_TOOLWINDOW;
     match kind {
-        Kind::Overlay => (pop, WS_POPUP),
-        Kind::Pin | Kind::Card | Kind::Tray => (pop | WS_EX_LAYERED, WS_POPUP),
+        Kind::Overlay | Kind::Pin | Kind::Card | Kind::Tray => (pop | WS_EX_LAYERED, WS_POPUP),
         Kind::PinBar | Kind::RecBar => (pop | WS_EX_LAYERED | WS_EX_NOACTIVATE, WS_POPUP),
         Kind::Toast | Kind::RecFrame => (pop | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE, WS_POPUP),
         // 设计稿的标题栏只有关闭按钮
@@ -161,6 +164,7 @@ impl Win {
             alpha: Cell::new(1.0),
             size: Cell::new((r.right - r.left, r.bottom - r.top)),
             fields: RefCell::new(Fields::default()),
+            echo: Cell::new(None),
         });
         let ptr = Box::into_raw(st);
         let hwnd = unsafe {
@@ -181,6 +185,10 @@ impl Win {
             // 钉图不要圆角
             Kind::Pin => {
                 dwm(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND);
+                let _ = unsafe { SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA) };
+            }
+            // 铺满整屏的普通窗口最后一次重画常常不上屏（见 WM_PAINT 的补刷）；分层后少见很多
+            Kind::Overlay => {
                 let _ = unsafe { SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA) };
             }
             // 标题栏奶油色、边框墨色，接上自绘内容（COLORREF 是 0xBBGGRR）；用户开了「在标题栏显示主题色」时也不出现蓝色
@@ -802,7 +810,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         let def = || DefWindowProcW(hwnd, msg, wp, lp);
         match msg {
             WM_PAINT => {
+                // 铺满整屏的遮罩最后一次重画有时不上屏，要等下一次重画才带出来（Win11 25H2、NVIDIA 240 Hz 实测：松手后工具栏不出现）。
+                // 停下来 32 ms 后把画过的范围原样再贴一遍，内容不变，只为让它上屏
+                let mut r = Rect::default();
+                let echo = kind == Kind::Overlay && GetUpdateRect(hwnd, Some(&mut r), false).as_bool();
                 paint(hwnd);
+                if echo {
+                    let mut u = r;
+                    if let Some(e) = st.echo.get() {
+                        let _ = UnionRect(&mut u, &r, &e);
+                    }
+                    st.echo.set(Some(u));
+                    SetTimer(Some(hwnd), ECHO_TIMER, 32, None);
+                }
                 settle();
             }
             WM_ERASEBKGND => return LRESULT(1),
@@ -920,6 +940,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     && let Some(r) = st.ime.get()
                 {
                     ime_follow(hwnd, r);
+                }
+            }
+            WM_TIMER if wp.0 == ECHO_TIMER => {
+                let _ = KillTimer(Some(hwnd), ECHO_TIMER);
+                if let Some(r) = st.echo.take() {
+                    let dc = GetDC(Some(hwnd));
+                    let _ = BitBlt(dc, r.left, r.top, r.right - r.left, r.bottom - r.top, Some(dc), r.left, r.top, SRCCOPY);
+                    ReleaseDC(Some(hwnd), dc);
                 }
             }
             WM_TIMER => deliver(hwnd, Event::Timer(wp.0)),
