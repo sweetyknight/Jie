@@ -50,7 +50,7 @@ sh scripts/macos/test.sh
 
 `cargo test` 默认跳过标为 `ignored` 的交互、性能和在线测试。交互测试会盖住屏幕一会儿，按模块一起跑，一次一个（例如 `cargo test overlay:: -- --ignored --test-threads 1`），样张存在 `target/test-tmp/` 下。在线测试（`llm_samples` 等）会调用设置里的服务、按量计费，不要直接批量运行全部忽略项。
 
-Windows 测试程序若仅在受限沙箱内报 `0xc0000142 / STATUS_DLL_INIT_FAILED`，先在普通终端（或经批准的沙箱外环境）重跑同一命令。沙箱外能正常运行时，不需要更换 DLL 或调整 CRT 链接配置；后续测试沿用该获准环境，不在同一受限沙箱内反复启动失败的程序。
+当前 Windows 主机已确认：受限沙箱内运行 Cargo 构建脚本（`build-script-build.exe`）或测试程序会触发 `0xc0000142 / STATUS_DLL_INIT_FAILED`，并弹出系统错误对话框。构建、测试、Clippy、打包及运行产物均从一开始就在普通终端或经批准的沙箱外环境执行，不先在沙箱内试跑。正常环境已能运行，不需要更换 DLL 或调整 CRT 链接配置；自动化执行要求见仓库根目录 `AGENTS.md`。
 
 - 吸附：`cargo test dump_screen -- --ignored` 存几张真实屏幕，`cargo test real_screens -- --ignored --nocapture` 打印每个点的层次并画出默认那层（`target/test-tmp/snap/`）。
 - 录屏界面：`cargo test record_flow -- --ignored` 截下真实屏幕存成 `target/test-tmp/record/scene-*.png`，并检查 GIF 画面第一行不是边框颜色（编进去的那圈动图边框除外）。框满整块屏幕的两种入口要用发布版（调试版编一帧 4K 要好几秒）：`cargo test --release full_screen -- --ignored --nocapture --test-threads 1`，控制条压在任务栏上、截屏截得到，它底下的色块录到一半由绿变橙，GIF 首帧那块是绿的、末帧是橙的。
